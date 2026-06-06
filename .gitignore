@@ -1,0 +1,30 @@
+# build
+build/
+build-*/
+cmake-build-*/
+
+# runtime data — never commit
+data/
+!data/.gitkeep
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# editor / OS
+.cache/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# compiled
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+compile_commands.json
+.ccls-cache/
+.clangd/
