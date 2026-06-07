@@ -3,8 +3,16 @@ resolver = "3"
 members = [
     "crates/momentum-core",
     "crates/momentum-api",
+    "crates/momentum-store",
     "bin/hello-rest",
     "bin/hello-s3",
+    "bin/smoke-universe",
+    "bin/smoke-day",
+    "bin/build-universe",
+    "bin/bulk-download",
+    "bin/build-splits",
+    "bin/build-dividends",
+    "bin/build-ticker-events",
 ]
 
 [workspace.package]
@@ -45,9 +53,27 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Arrow / Parquet — version pinned to match duckdb's bundled arrow so RecordBatch
+# streams from `duckdb::query_arrow()` are zero-conversion handed to ArrowWriter.
+arrow = { version = "58", default-features = false, features = ["chrono-tz", "csv"] }
+parquet = { version = "58", default-features = false, features = ["arrow", "zstd", "snap"] }
+
+# Embedded analytical DB (used for the M3 bulk pivot and the BarReader UNION view).
+duckdb = { version = "1.4", features = ["bundled"] }
+
+# Random (jitter for retry backoff). Pull in once at the workspace level.
+fastrand = "2"
+
+# Resume cursor for the bulk ingest. `bundled` so we don't depend on system sqlite.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Test deps
+wiremock = "0.6"
+
 # Workspace-internal
-momentum-core = { path = "crates/momentum-core" }
-momentum-api  = { path = "crates/momentum-api" }
+momentum-core  = { path = "crates/momentum-core" }
+momentum-api   = { path = "crates/momentum-api" }
+momentum-store = { path = "crates/momentum-store" }
 
 [profile.dev]
 opt-level = 0

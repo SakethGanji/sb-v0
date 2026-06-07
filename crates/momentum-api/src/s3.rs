@@ -17,6 +17,23 @@ pub enum S3Error {
     Io(#[from] std::io::Error),
 }
 
+impl S3Error {
+    /// Returns true iff this is a `GetObject` NoSuchKey error — i.e. the
+    /// object doesn't exist (vs. a transient infrastructure failure).
+    /// Bulk-download treats NoSuchKey as a terminal empty-success because
+    /// holidays / future dates / non-trading days are all valid reasons
+    /// for the key to be absent.
+    pub fn is_no_such_key(&self) -> bool {
+        use aws_sdk_s3::error::SdkError;
+        use aws_sdk_s3::operation::get_object::GetObjectError;
+        matches!(
+            self,
+            Self::Get(SdkError::ServiceError(svc))
+                if matches!(svc.err(), GetObjectError::NoSuchKey(_))
+        )
+    }
+}
+
 pub struct FlatFileClient {
     bucket: String,
     s3: Client,

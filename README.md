@@ -129,12 +129,32 @@ sb-v0/
 │   ├── bars_1m_raw/         # immutable 1-min, source-of-truth (per §5.4)
 │   ├── bars_1m_deltas/      # sibling: incremental days (post-bulk), no glob collision
 │   ├── bars_1m_tail/        # sibling: REST tail-window only
-│   ├── bars_1m/             # split-adjusted 1-min (engine reads, rolls up to 10-min)
+│   # (no derived bars_1m/ — split adjustment is applied at read time by BarReader; see §5.3 amended 2026-06-06)
 │   └── output/               # per_trade_bar_path, per_trade_summary, portfolio/
 └── xtask/                    # cargo-xtask: schema codegen, golden-test fixtures
 ```
 
 **Crate boundaries are real and enforced.** Each `crates/momentum-*` is a separate library crate with its own `Cargo.toml`; modules inside re-export only what's needed publicly. This keeps incremental compile times sane (a change to the path recorder shouldn't rebuild the S3 client) and forces clear ownership of types — `SecurityId` is defined exactly once, in `momentum-core`, and every other crate depends on it.
+
+### Bins currently present
+
+| Bin | Purpose | Default output | When to run |
+|---|---|---|---|
+| `hello-rest` | M0 sanity: GET `/v3/reference/tickers/AAPL`, print decoded JSON. | stdout | Once, to verify API auth. |
+| `hello-s3` | M0 sanity: GET one flat-file day, gunzip, print first 5 CSV rows. | stdout | Once, to verify S3 auth. |
+| `smoke-universe` | List `type=CS&market=stocks` active + delisted, write to `data/_smoke/`. **No enrichment.** Reports coverage diagnostics (FIGI %, delisted_utc on inactive %). | `data/_smoke/reference/tickers.parquet` | Anytime, to re-measure list-endpoint coverage. |
+| `smoke-day` | Download one flat file, decode, partition by ticker into `data/_smoke/`. Reports null-`security_id` count (universe-miss diagnostic). | `data/_smoke/bars_1m_raw/{T}.parquet` | Anytime, to spot-check a date end-to-end. |
+| `build-universe` | **Production universe build.** Page list endpoint, run scoped per-ticker enrichment (only rows missing FIGI or delisted_utc), write to real path. | `data/reference/tickers.parquet` | Monthly per §11.3 reference cadence, plus any time renames/delistings happen. |
+| `bulk-download` | **M3 stage 1.** Download every weekday's flat file in `[START_DATE, END_DATE]` into the staging dir. Bounded concurrency, retry+jitter, NoSuchKey → empty-success, SQLite resume cursor. `START_DATE` and `END_DATE` are required env vars (no accidental 80 GB pulls). | `data/_staging/flat_files/YYYY/MM/{date}.csv.gz` + `data/_ingest_state.sqlite` | Once for the historical backfill (effective window starts **2016-06-08** due to entitlement boundary, not the spec's 2015-01-01); incrementally for daily updates if a separate path doesn't take over. |
+| `build-splits` | **M4.** Paginate `/stocks/v1/splits`, attach `security_id` via tickers FIGI map, write `splits.parquet` with `splits_snapshot_date` stamped in file-level Parquet metadata (= the read-time pin source per §5.3). | `data/reference/splits.parquet` | Whenever splits change (rare) or as part of a coordinated reference refresh. |
+| `build-dividends` | **M4.** Paginate `/stocks/v1/dividends`, attach `security_id`, write `dividends.parquet`. Stored as events joined to per-trade summaries (§5.3.1); NOT folded into bars. | `data/reference/dividends.parquet` | Monthly with other reference refreshes. |
+| `build-ticker-events` | **M4.** For every active+FIGI row in `tickers.parquet`, call `/vX/reference/tickers/{id}/events`. Bounded concurrency (default 10). Output is one row per rename event; figi_map can be derived from it. | `data/reference/ticker_events.parquet` | Monthly with other reference refreshes. |
+
+`smoke-*` bins write under `data/_smoke/` so iterating doesn't clobber the production cache. `build-universe` writes to `data/reference/` and is the one wired to the cache the rest of the pipeline reads. Both share the same code path under the hood — `RestClient`, `enrich_universe_gap`, `write_tickers` — so the smoke output and the production output have identical Parquet schema and identical row semantics modulo the enrichment pass.
+
+Env overrides on `build-universe`: `MASSIVE_API_KEY` (required), `MASSIVE_REST_BASE`, `OUT_PATH`, `ENRICH_CONCURRENCY` (default 10), `ENRICH_MAX_ATTEMPTS` (default 5), `SKIP_ENRICH=1` to disable the second pass.
+
+**Measured coverage (2026-06-07).** After enrichment, FIGI is present on **79% of active** (4,191 / 5,289) and **43% of delisted** (2,837 / 6,512); `delisted_utc` is present on 96% of inactive rows. The enrichment gap that remains is bounded by Massive's detail endpoint — 3,845 of 4,958 enrichment calls returned 404, meaning the symbol isn't carried at all (typically old delisted tickers from before Massive's FIGI assignment era). **Engineering implication:** ~1,098 active tickers (21%) fall back to `display_symbol` as the join key and would silently lose data on rename. Phase 0 accepts the gap; the engine should LOG fallbacks so golden tests can pin the loss.
 
 **Why a workspace, not a single crate.** A single-crate layout is fine for ≤10 modules; this design has ~8 logical components with non-trivial dependency surface (the engine depends on store + calendar + signal but not on the REST client). Workspace incremental rebuilds during M5–M7 (engine churn) will not retrigger Arrow C++ → Rust FFI compilation in the store crate.
 
@@ -346,13 +366,24 @@ The ingest step is the riskiest and most expensive — design it to be
 - Cap memory: stream JSON → Arrow `RecordBatch` → Parquet writer; never collect a whole response into a `String` or `Vec<u8>`. `reqwest::Response::bytes_stream()` plus `futures_util::StreamExt::next()` feeds bytes incrementally. Same rule for flat-file ingest: `aws_sdk_s3::primitives::ByteStream` → `flate2::read::GzDecoder` → `arrow::csv::ReaderBuilder` → `parquet::arrow::AsyncArrowWriter`. No aggregation pass — 1-min rows pass through unchanged. Never materialize a full day's market-wide CSV in RAM (one day is ~50 GB uncompressed for the full universe).
 - **Persistent ingest cursor (SQLite via `rusqlite`).** Recomputing what's missing from the JSON manifest on every restart is O(universe) and gets slow on partial failures. Maintain a `data/_ingest_state.sqlite` with `(ticker TEXT, last_completed_window_to INTEGER, status TEXT, last_error TEXT, attempt_count INTEGER)`, written transactionally after each successful Parquet flush. The `rusqlite` connection lives behind a `Mutex<Connection>` in the ingest crate; cross-task access is via `tokio::task::spawn_blocking` because `rusqlite` is sync. (We do not use `sqlx` here — its async-from-the-start design buys us nothing for a single-process, write-mostly cursor table, and `rusqlite` + `bundled` is a smaller dependency surface.) Reboot resumes from the cursor in milliseconds; the JSON manifest remains the human-readable summary of what's on disk.
 
-### 5.3 Split-adjusted bars for engine mechanics; dividends stored separately (frozen)
+### 5.3 Split adjustment is applied at read time, not materialized (frozen, amended 2026-06-06)
 
-Flat files ship **unadjusted raw tape**. We apply **split adjustment
-only** to the engine-facing bars; cash dividends are stored as events
-and not folded into the price line. Earlier drafts of this section froze
-"split *and* dividend adjustment together" — that was wrong, and is
-reversed here. The reasoning:
+Flat files ship **unadjusted raw tape**. We do **not** materialize a
+derived `bars_1m/` directory. The split factor is applied **at read
+time** by the bar reader, against a pinned `splits.parquet` snapshot.
+Cash dividends remain stored as events, not folded into the price line.
+
+**This section was amended 2026-06-06 (decision 0a).** Earlier drafts
+required a derived `bars_1m/{T}.parquet` directory written by an
+offline split-adjustment kernel. We dropped that for three reasons:
+(1) the multiply is sub-millisecond per ticker, so the materialized
+file saves no engine wall-clock; (2) it halves disk (~50 GB → ~25 GB
+for the full historical window) and removes a whole pipeline stage;
+(3) per-file `splits_snapshot_date` metadata stamps were the messy
+part of the old design — a single run-level pin against
+`splits.parquet`'s own snapshot date is simpler and equally safe.
+
+Why splits are applied, dividends are not:
 
 - The Phase 0 exit rule is a price-based breakeven stop: `bar.low <=
   entry_price`. On ex-dividend day, the price *really does* drop by
@@ -377,18 +408,18 @@ Pipeline:
 
 ```
 bars_1m_raw/{T}.parquet  (canonical, from flat files, immutable)
-        + splits.parquet  (snapshot, stamped)
+        + splits.parquet  (snapshot, stamped at file level via parquet metadata)
         ↓
-        split-adjustment kernel (deterministic)
+        BarReader::session_bars(sid, day)  — multiplies raw OHLC × split_factor_cum,
+                                              divides raw volume ÷ split_factor_cum,
+                                              against the run-pinned snapshot
         ↓
-bars_1m/{T}.parquet  (split-adjusted; what the engine reads)
-        + columns: o, h, l, c, v, split_factor_cum
-        + parquet metadata: splits_snapshot_date
+        (in-memory adjusted bars; never written to disk)
 
 dividends.parquet  (snapshot, stamped — joined alongside paths in analytics, never into bars)
 ```
 
-**Adjustment math:**
+**Adjustment math (applied at read time):**
 
 ```
 adjusted_price  =  raw_price  ×  split_factor_cum
@@ -401,37 +432,35 @@ adjusted_volume =  raw_volume ÷  split_factor_cum
 
 Rules:
 
-- **Splits applied to bars; dividends not applied to bars.**
-  Both data sets are pulled, snapshotted, and stamped; only splits feed
-  the bar-adjustment kernel.
-- **Each `bars_1m/{T}.parquet` carries its own `splits_snapshot_date`
-  in metadata.** Per-ticker incremental rebuild is legal and expected;
-  the corpus is not required to share a single snapshot date. (An
-  earlier draft required "one snapshot per build, mixed = build error,"
-  which is incompatible with the per-ticker incremental rebuild rule
-  below. The per-file stamp resolves the contradiction.)
-- When a new split appears in a later snapshot, **only the affected
-  ticker's adjusted file is recomputed from raw** — no re-download —
-  and its `splits_snapshot_date` is bumped to the new snapshot's date.
+- **Splits applied at BarReader read time; dividends not applied at
+  all.** Both reference parquets are pulled, snapshotted, and stamped;
+  only splits feed the read-time multiply.
+- **`splits.parquet` carries `splits_snapshot_date` in its file-level
+  Parquet metadata.** This is the single source of truth for the pin.
+  No per-bar-file stamps; raw bars are immutable and have no
+  adjustment basis to stamp.
 - The eligibility comparison `bar.low <= entry_price` operates on
-  split-adjusted bars from a single snapshot. Phantom-split-gap risk
-  is eliminated by construction; ex-dividend drops are *not*
+  read-time-adjusted bars under a single snapshot. Phantom-split-gap
+  risk is eliminated by construction; ex-dividend drops are *not*
   eliminated and that is the intended behavior.
-- **Snapshot-freeze per backtest run (frozen).** A backtest run pins
-  the `splits_snapshot_date` it will use at startup, and refuses to
-  read any `bars_1m/{T}.parquet` whose stamp is newer than the pin.
-  Reason: a stored `entry_price` is denominated in the adjustment
-  basis that was current when the trade was opened. If a fresh split
-  bumps that ticker's snapshot mid-run, every open trade's
-  `entry_price` is now in stale units and the breakeven check
-  silently misfires. Pinning the snapshot keeps `entry_price` and
-  every subsequent bar in the same units for the life of the run.
-  To incorporate a new split: rebuild the affected `bars_1m/{T}`
-  from raw, then start a fresh run against the new snapshot date.
+- **Snapshot-pin per backtest run (frozen).** A backtest run pins
+  `splits_snapshot_date` at startup (read from `splits.parquet`
+  metadata) and **refuses to apply any split row with
+  `effective_date > pin`**. Reason: a stored `entry_price` is
+  denominated in the adjustment basis that was current when the trade
+  was opened. If `splits.parquet` is refreshed mid-run with a fresh
+  split, every open trade's `entry_price` is now in stale units and
+  the breakeven check silently misfires. Pinning the snapshot keeps
+  `entry_price` and every subsequent bar in the same units for the
+  life of the run. To incorporate a new split: re-snapshot
+  `splits.parquet`, then start a fresh run against the new snapshot
+  date — no bar files need rebuilding.
 - Audit roundtrip (tested as property §8):
   - `adjusted_price ÷ split_factor_cum == raw_price`
   - `adjusted_volume × split_factor_cum == raw_volume`
   - Both within float64 epsilon.
+  - Now a property over the read-time multiply function, not over an
+    offline kernel.
 
 ### 5.3.1 Dividend handling downstream
 
@@ -453,12 +482,11 @@ Cash dividends are joined to paths as events, not bars:
 ### 5.4 Cache layout
 
 ```
-data/bars_1m_raw/{ticker}.parquet          # unadjusted 1-min, immutable, source of truth
+data/bars_1m_raw/{ticker}.parquet          # unadjusted 1-min, immutable, source of truth — engine reads this and applies split factor at read time (§5.3)
 data/bars_1m_deltas/YYYY-MM-DD.parquet     # incremental days, sibling dir so the bars_1m_raw/*.parquet glob never picks them up (§5.1 step 4)
 data/bars_1m_tail/_rest_tail.parquet       # REST tail-window only, sibling dir (§5.1 step 5)
-data/bars_1m/{ticker}.parquet              # split-adjusted 1-min, derived; engine reads this and rolls up to 10-min at read time (§6.2)
 data/reference/tickers.parquet
-data/reference/splits.parquet               # stamped with snapshot date
+data/reference/splits.parquet               # stamped with snapshot date (file-level Parquet metadata) — pin source for the run (§5.3)
 data/reference/dividends.parquet            # stamped with snapshot date; joined to paths as events (§5.3.1), not folded into bars
 data/reference/ticker_events.parquet        # rename chain: (display_symbol, t) → security_id
 data/reference/figi_map.parquet             # (security_id, display_symbol, valid_from, valid_to) — sourced from ticker_events
@@ -780,7 +808,7 @@ Golden test for half-days is in §8.
 | M1 | Universe snapshot end-to-end (active + delisted, paginated, Parquet) via `momentum-api::tickers`. `serde`-decoded → `arrow::RecordBatchBuilder` → `parquet::ArrowWriter`. | `tickers.parquet` | 1–2 days |
 | M2 | Flat-file ingest for a single recent day, written as 1-min Parquet partitioned by ticker (no aggregation). End-to-end byte-stream from `aws-sdk-s3::ByteStream` through `flate2` into `arrow::csv::ReaderBuilder` → `parquet::arrow::AsyncArrowWriter` without staging. | `bars_1m_raw/*.parquet` for one date | 0.5–1 day |
 | M3 | Bulk flat-file ingest at scale: download every day in `[2015, T-1]` into `_staging/`, then a single end-of-bulk per-ticker pivot pass writing each `bars_1m_raw/{T}.parquet` exactly once. `tokio::sync::Semaphore`-bounded S3 concurrency, `rusqlite` cursor, plus the REST tail-filler for the lagging window. Sibling `bars_1m_deltas/` / `bars_1m_tail/` dirs (no glob collision with the historical partition glob). | `bars_1m_raw/*.parquet` for full 2015→T window | 2 days |
-| M4 | Splits / dividends / ticker-events ingest **+ split-adjustment kernel (one `split_factor_cum`, applied to price *and* volume) producing `bars_1m/` from `bars_1m_raw/`. Dividends pulled but NOT folded into bars — joined to paths as events per §5.3.1.** Audit roundtrip is a `proptest` over the split kernel. Snapshot-freeze pin enforced at run startup (§5.3). | reference parquets + split-adjusted bars + dividend-event annotations + audit roundtrip passing | 2 days |
+| M4 | Splits / dividends / ticker-events ingest **+ read-time split adjustment in `BarReader` (one `split_factor_cum`, applied to price *and* volume against pinned `splits.parquet` snapshot — no derived bars file, see §5.3 amended 2026-06-06). Dividends pulled but NOT folded into bars — joined to paths as events per §5.3.1.** Audit roundtrip is a `proptest` over the read-time multiply function. Snapshot-pin enforced at run startup (§5.3). | reference parquets + dividend-event annotations + `BarReader` impl over `bars_1m_raw/` with split-multiply + audit roundtrip passing | 2 days |
 | M5 | Backtest engine v0 in `momentum-engine`: signal + entry only, no exit logic. Single-threaded, synchronous, reads via `momentum-store::BarReader`. | `per_trade_summary.parquet` with entry-only rows | 2 days |
 | M6 | Exit logic + path recorder (10-min bar resolution, full 252-day horizon, half-day calendar aware). `Position::check_breakeven_stop` is the single exit predicate (§6.4). | full `per_trade_bar_path.parquet` | 2–3 days |
 | M7 | Terminal accounting (delist/merge/halt/horizon). `PathEndReason` + `TerminalValueSource` `#[non_exhaustive]` enums enforce the §6.6 separation. | `path_end_reason` populated | 1–2 days |

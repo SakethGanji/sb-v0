@@ -1,0 +1,20 @@
+[package]
+name = "bulk-download"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "bulk-download"
+path = "src/main.rs"
+
+[dependencies]
+momentum-api.workspace = true
+momentum-store.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

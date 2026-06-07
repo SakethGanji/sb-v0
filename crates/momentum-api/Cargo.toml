@@ -19,3 +19,8 @@ chrono.workspace = true
 flate2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+fastrand.workspace = true
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tokio = { workspace = true }
