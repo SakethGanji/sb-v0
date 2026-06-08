@@ -29,6 +29,28 @@ pub struct TickerDetails {
     pub share_class_figi: Option<String>,
     pub last_updated_utc: Option<String>,
     pub delisted_utc: Option<String>,
+
+    // ---- Classification fields (build-ticker-details) ----
+    pub market_cap: Option<f64>,
+    pub sic_code: Option<String>,
+    pub sic_description: Option<String>,
+    pub ticker_root: Option<String>,
+    pub total_employees: Option<i64>,
+    pub list_date: Option<String>, // yyyy-mm-dd
+    pub share_class_shares_outstanding: Option<f64>,
+    pub weighted_shares_outstanding: Option<f64>,
+    pub round_lot: Option<i32>,
+    pub description: Option<String>,
+    pub address: Option<TickerAddress>,
+    pub homepage_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TickerAddress {
+    pub city: Option<String>,
+    pub state: Option<String>,
+    pub postal_code: Option<String>,
+    pub address1: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,6 +213,173 @@ impl RestClient {
             if let Some(rs) = parsed.results {
                 all.extend(rs);
             }
+            match parsed.next_url {
+                Some(u) if !u.is_empty() => next = Some(u),
+                _ => break,
+            }
+        }
+        Ok(all)
+    }
+}
+
+// =============================================================================
+// Short interest — `GET /stocks/v1/short-interest`. FINRA bi-weekly
+// settlement. The endpoint serves the WHOLE universe per call (no
+// ticker filter required); a single global pagination pulls everything
+// in ~120 pages of 10k rows each.
+// =============================================================================
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ShortInterest {
+    pub ticker: String,
+    pub settlement_date: String, // yyyy-mm-dd
+    pub short_interest: f64,
+    pub avg_daily_volume: Option<f64>,
+    pub days_to_cover: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShortInterestResponse {
+    results: Option<Vec<ShortInterest>>,
+    next_url: Option<String>,
+    #[allow(dead_code)]
+    status: Option<String>,
+    #[allow(dead_code)]
+    request_id: Option<String>,
+}
+
+impl RestClient {
+    /// Paginate `/stocks/v1/short-interest` returning every row Massive
+    /// publishes (whole universe × all bi-weekly settlement dates).
+    /// `progress` is called after each page with the running total.
+    pub async fn list_short_interest<F>(
+        &self,
+        mut progress: F,
+    ) -> Result<Vec<ShortInterest>, RestError>
+    where
+        F: FnMut(usize, usize),
+    {
+        const PAGE_CAP: usize = 8192;
+        let mut all: Vec<ShortInterest> = Vec::new();
+        let mut next: Option<String> = None;
+        for page in 0..=PAGE_CAP {
+            if page == PAGE_CAP {
+                return Err(RestError::PaginationOverflow { cap: PAGE_CAP });
+            }
+            let url = next
+                .clone()
+                .unwrap_or_else(|| format!("{}/stocks/v1/short-interest", self.base_url));
+            let mut req = self.http.get(&url).query(&[("apiKey", &self.api_key)]);
+            if next.is_none() {
+                req = req.query(&[("limit", "10000")]);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(RestError::Status {
+                    status: status.as_u16(),
+                    url,
+                    body,
+                });
+            }
+            let parsed: ShortInterestResponse = resp.json().await?;
+            let got = parsed.results.as_ref().map(|r| r.len()).unwrap_or(0);
+            if let Some(rs) = parsed.results {
+                all.extend(rs);
+            }
+            progress(page + 1, all.len());
+            match parsed.next_url {
+                Some(u) if !u.is_empty() => next = Some(u),
+                _ => {
+                    let _ = got;
+                    break;
+                }
+            }
+        }
+        Ok(all)
+    }
+}
+
+// =============================================================================
+// Financials — `GET /vX/reference/financials`. SEC filings (10-Q, 10-K)
+// with `acceptance_datetime` as the point-in-time stamp. Max page size
+// is 100 (confirmed by probe — limit=1000 returns 0 rows). Whole
+// universe pulled via a single global pagination; the bin filters out
+// TTM rollups (no filing_date) and joins per-ticker to the FIGI map.
+// =============================================================================
+
+/// Raw envelope shape returned by Massive — only the top-level fields
+/// the writer extracts as typed columns are deserialized here; the rest
+/// stays in `financials_raw` for JSON pass-through.
+#[derive(Debug, Deserialize, Clone)]
+pub struct Financial {
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub filing_date: Option<String>,
+    pub acceptance_datetime: Option<String>,
+    pub timeframe: Option<String>,
+    pub fiscal_period: Option<String>,
+    pub fiscal_year: Option<String>,
+    pub cik: Option<String>,
+    pub sic: Option<String>,
+    pub tickers: Option<Vec<String>>,
+    pub company_name: Option<String>,
+    pub source_filing_url: Option<String>,
+    /// Keeps the original `financials` object as serde_json::Value so the
+    /// writer can both extract a handful of native fields and persist the
+    /// whole struct as a JSON string.
+    #[serde(default)]
+    pub financials: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct FinancialsResponse {
+    results: Option<Vec<Financial>>,
+    next_url: Option<String>,
+    #[allow(dead_code)]
+    status: Option<String>,
+    #[allow(dead_code)]
+    request_id: Option<String>,
+}
+
+impl RestClient {
+    /// Paginate `/vX/reference/financials` (no ticker filter). Returns
+    /// every filing Massive publishes. The bin should filter out TTM
+    /// rollups (`filing_date is None`).
+    pub async fn list_financials<F>(&self, mut progress: F) -> Result<Vec<Financial>, RestError>
+    where
+        F: FnMut(usize, usize),
+    {
+        const PAGE_CAP: usize = 16384;
+        let mut all: Vec<Financial> = Vec::new();
+        let mut next: Option<String> = None;
+        for page in 0..=PAGE_CAP {
+            if page == PAGE_CAP {
+                return Err(RestError::PaginationOverflow { cap: PAGE_CAP });
+            }
+            let url = next
+                .clone()
+                .unwrap_or_else(|| format!("{}/vX/reference/financials", self.base_url));
+            let mut req = self.http.get(&url).query(&[("apiKey", &self.api_key)]);
+            if next.is_none() {
+                req = req.query(&[("limit", "100")]);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(RestError::Status {
+                    status: status.as_u16(),
+                    url,
+                    body,
+                });
+            }
+            let parsed: FinancialsResponse = resp.json().await?;
+            if let Some(rs) = parsed.results {
+                all.extend(rs);
+            }
+            progress(page + 1, all.len());
             match parsed.next_url {
                 Some(u) if !u.is_empty() => next = Some(u),
                 _ => break,

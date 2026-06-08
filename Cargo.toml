@@ -4,6 +4,7 @@ members = [
     "crates/momentum-core",
     "crates/momentum-api",
     "crates/momentum-store",
+    "crates/momentum-calendar",
     "bin/hello-rest",
     "bin/hello-s3",
     "bin/smoke-universe",
@@ -17,6 +18,12 @@ members = [
     "bin/convert-staging",
     "bin/verify-pivot",
     "bin/audit-bars",
+    "bin/smoke-calendar",
+    "bin/pull-fred-vix",
+    "bin/build-ticker-details",
+    "bin/build-short-interest",
+    "bin/build-financials",
+    "bin/build-edgar-acceptance",
 ]
 
 [workspace.package]
@@ -75,9 +82,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 wiremock = "0.6"
 
 # Workspace-internal
-momentum-core  = { path = "crates/momentum-core" }
-momentum-api   = { path = "crates/momentum-api" }
-momentum-store = { path = "crates/momentum-store" }
+momentum-core     = { path = "crates/momentum-core" }
+momentum-api      = { path = "crates/momentum-api" }
+momentum-store    = { path = "crates/momentum-store" }
+momentum-calendar = { path = "crates/momentum-calendar" }
 
 [profile.dev]
 opt-level = 0

@@ -11,9 +11,9 @@
 //! 2022-06-09.
 //!
 //! Optional env (with defaults):
-//!   TICKER_EVENTS_PATH=data/_smoke/reference/ticker_events.parquet
-//!   TICKERS_PATH=data/_smoke/reference/tickers_enriched.parquet
-//!   OUT_PATH=data/_smoke/reference/figi_map.parquet
+//!   TICKER_EVENTS_PATH=data/reference/ticker_events.parquet
+//!   TICKERS_PATH=data/reference/tickers_enriched.parquet
+//!   OUT_PATH=data/reference/figi_map.parquet
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -27,13 +27,13 @@ fn main() -> Result<()> {
 
     let events_path: PathBuf = std::env::var("TICKER_EVENTS_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("data/_smoke/reference/ticker_events.parquet"));
+        .unwrap_or_else(|_| PathBuf::from("data/reference/ticker_events.parquet"));
     let tickers_path: PathBuf = std::env::var("TICKERS_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("data/_smoke/reference/tickers_enriched.parquet"));
+        .unwrap_or_else(|_| PathBuf::from("data/reference/tickers_enriched.parquet"));
     let out_path: PathBuf = std::env::var("OUT_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("data/_smoke/reference/figi_map.parquet"));
+        .unwrap_or_else(|_| PathBuf::from("data/reference/figi_map.parquet"));
 
     if !events_path.exists() {
         anyhow::bail!(

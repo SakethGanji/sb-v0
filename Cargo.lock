@@ -910,12 +910,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "build-edgar-acceptance"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "duckdb",
+ "fastrand",
+ "momentum-store",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "build-figi-map"
 version = "0.0.0"
 dependencies = [
  "anyhow",
  "chrono",
  "momentum-store",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "build-financials"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "momentum-api",
+ "momentum-store",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "build-short-interest"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "momentum-api",
+ "momentum-store",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -928,6 +973,22 @@ dependencies = [
  "chrono",
  "momentum-api",
  "momentum-store",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "build-ticker-details"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "chrono",
+ "fastrand",
+ "momentum-api",
+ "momentum-store",
+ "parquet",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2452,6 +2513,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "momentum-calendar"
+version = "0.0.0"
+dependencies = [
+ "arrow",
+ "chrono",
+ "chrono-tz",
+ "momentum-core",
+ "parquet",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "momentum-core"
 version = "0.0.0"
 dependencies = [
@@ -2772,6 +2847,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "pull-fred-vix"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "momentum-store",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3455,6 +3545,15 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
+name = "smoke-calendar"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "momentum-calendar",
+]
 
 [[package]]
 name = "smoke-day"
