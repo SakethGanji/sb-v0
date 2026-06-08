@@ -1,8 +1,9 @@
 pub mod bar_reader;
 pub mod bulk_download;
+pub mod daily_convert;
 pub mod dividends;
+pub mod figi_map;
 pub mod flat_file;
-pub mod pivot;
 pub mod splits;
 pub mod ticker_events;
 pub mod tickers;

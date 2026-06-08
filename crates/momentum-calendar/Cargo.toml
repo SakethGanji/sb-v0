@@ -1,0 +1,19 @@
+[package]
+name = "momentum-calendar"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+momentum-core = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

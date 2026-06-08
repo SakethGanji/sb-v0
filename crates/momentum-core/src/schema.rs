@@ -108,6 +108,27 @@ pub fn ticker_events_schema() -> SchemaRef {
 
 pub const TICKER_EVENTS_SNAPSHOT_DATE_META: &str = "ticker_events_snapshot_date";
 
+/// `figi_map.parquet` — derived from `ticker_events.parquet` + the
+/// current universe. One row per (security_id, display_symbol,
+/// validity-window) so the engine can resolve `SecurityId → ticker` at
+/// any historical day. `valid_from = NULL` means open-start (no prior
+/// rename observed); `valid_to = NULL` means current.
+pub fn figi_map_schema() -> SchemaRef {
+    static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
+    SCHEMA
+        .get_or_init(|| {
+            Arc::new(Schema::new(vec![
+                Field::new("security_id", DataType::Utf8, false),
+                Field::new("display_symbol", DataType::Utf8, false),
+                Field::new("valid_from", DataType::Date32, true),
+                Field::new("valid_to", DataType::Date32, true),
+            ]))
+        })
+        .clone()
+}
+
+pub const FIGI_MAP_SNAPSHOT_DATE_META: &str = "figi_map_snapshot_date";
+
 pub fn tickers_schema() -> SchemaRef {
     static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
     SCHEMA

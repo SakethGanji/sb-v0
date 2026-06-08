@@ -1,0 +1,17 @@
+[package]
+name = "verify-pivot"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "verify-pivot"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+arrow.workspace = true
+chrono.workspace = true
+parquet.workspace = true

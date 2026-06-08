@@ -186,7 +186,7 @@ All deps below are Cargo crates resolved into a single `Cargo.lock`. No system p
 
 | Crate | Why |
 |---|---|
-| **`proptest`** | Property-based testing. Exit-rule invariants (`phase0_exit_fill_price <= entry_price`), schema round-trips, adjustment kernel roundtrips (§5.3, §8). |
+| **`proptest`** | Property-based testing. Exit-rule invariants (`phase0_exit_fill_price <= entry_price`), schema round-trips, read-time split-multiply roundtrips (§5.3, §8). |
 | **`insta`** + `yaml`, `json` features | Golden-snapshot tests. The hand-verified trades from §8 become `assert_yaml_snapshot!` calls; diffs are reviewed via `cargo insta review`. |
 | **`pretty_assertions`** | Diff-friendly assertion output for the golden tests. |
 | **`tempfile`** | Scratch directories for integration tests that exercise the on-disk cache. |
@@ -225,9 +225,9 @@ pub struct DisplaySymbol(String); // the ticker as it appeared at a given timest
 
 `SecurityId` and `DisplaySymbol` are *not* interchangeable — a function that joins on identity takes `&SecurityId`, a function that renders for a human takes `&DisplaySymbol`, and the compiler enforces the distinction. The rename chain from `/vX/reference/tickers/{id}/events` is the only code path that converts between them, exposed as `RenameChain::resolve(symbol: &DisplaySymbol, at: DateTime<Utc>) -> SecurityId`.
 
-`per_trade_summary` therefore has both `security_id` and `entry_display_symbol`; `bars_1m/` files are still partitioned by *current* display symbol for fast file-level lookup, but every row carries `security_id` as the durable identity. Engine joins use `security_id`.
+`per_trade_summary` therefore has both `security_id` and `entry_display_symbol`; `bars_1m_raw/` files are still partitioned by *current* display symbol for fast file-level lookup, but every row carries `security_id` as the durable identity. Engine joins use `security_id`.
 
-**No file is rewritten on rename.** Pre-rename bars stay in their original `bars_1m/{old_symbol}.parquet`; post-rename bars accumulate in `{new_symbol}.parquet`. The bar reader takes `(SecurityId, t_range)`, resolves the affected display symbols via the rename chain in `figi_map.parquet`, and UNIONs the matching files. The only operation that rewrites a `bars_1m/` file is split-snapshot recomputation (§5.3); renames never trigger one.
+**No file is rewritten on rename.** Pre-rename bars stay in their original `bars_1m_raw/{old_symbol}.parquet`; post-rename bars accumulate in `{new_symbol}.parquet`. The bar reader takes `(SecurityId, t_range)`, resolves the affected display symbols via the rename chain in `figi_map.parquet`, and UNIONs the matching files. Per decision 0a (§5.3) split adjustment is applied at read time against a pinned `splits.parquet` snapshot — no `bars_1m_raw/` file is ever rewritten by either renames or splits.
 
 **Closed-set enums catch the path-end ambiguity at compile time.** Per §6.6, bankruptcies and acquisitions must not share a terminal code path. In Rust:
 
@@ -482,27 +482,32 @@ Cash dividends are joined to paths as events, not bars:
 ### 5.4 Cache layout
 
 ```
-data/bars_1m_raw/{ticker}.parquet          # unadjusted 1-min, immutable, source of truth — engine reads this and applies split factor at read time (§5.3)
-data/bars_1m_deltas/YYYY-MM-DD.parquet     # incremental days, sibling dir so the bars_1m_raw/*.parquet glob never picks them up (§5.1 step 4)
-data/bars_1m_tail/_rest_tail.parquet       # REST tail-window only, sibling dir (§5.1 step 5)
+data/bars_1m_raw/YYYY-MM-DD.parquet         # unadjusted 1-min, immutable, source of truth — one Parquet per trading day, every ticker that traded that day, sorted by (display_symbol, t) (§5.3)
+data/bars_1m_tail/_rest_tail.parquet        # REST tail-window only, sibling dir (§5.1 step 5)
 data/reference/tickers.parquet
 data/reference/splits.parquet               # stamped with snapshot date (file-level Parquet metadata) — pin source for the run (§5.3)
 data/reference/dividends.parquet            # stamped with snapshot date; joined to paths as events (§5.3.1), not folded into bars
 data/reference/ticker_events.parquet        # rename chain: (display_symbol, t) → security_id
 data/reference/figi_map.parquet             # (security_id, display_symbol, valid_from, valid_to) — sourced from ticker_events
 data/output/eligibility_log.parquet         # (date, security_id, eligible, reason) — persisted per-day decisions
-data/_staging/flat_files/YYYY/MM/...        # transient bulk-download staging (purged after partitioning)
+data/_staging/flat_files/YYYY/MM/...        # raw CSV.gz from Massive — keep read-only; convert-staging reads these into bars_1m_raw/
 data/_manifest.json                         # human-readable summary of coverage
 data/_ingest_state.sqlite                   # resume cursor (§5.2)
 ```
 
-SPY no longer needs its own file — it's just one ticker among many in
-the daily flat files, so it lives in `bars_1m_raw/SPY.parquet` like
-everything else. The trading-day calendar is derived from
-`SELECT DISTINCT date FROM bars_1m_raw/SPY` at engine startup.
+**Storage shape — per day, not per ticker (amended 2026-06-06 after the
+per-ticker pivot was rejected).** The engine is day-major: the daily
+loop opens one file per outer-iter and resolves "this ticker on this
+day" via a `display_symbol` filter (predicate pushdown on the
+column's row-group min/max stats). Per-day storage is what the CSV.gz
+input already is, so the converter is a 1:1 file-shape pass — no
+sort, no merge, no spill. An earlier draft of this spec called for
+per-ticker partitioning; that required a 3 B-row global external sort
+to pivot, didn't survive contact with the day-major engine, and was
+dropped. See the frozen-decisions per-day storage amendment.
 
-Partition-by-ticker is fine for Phase 0's scale (~10k tickers). If we
-later scale to ticks, switch to date-partitioned.
+SPY lives inside the same per-day files. The trading-day calendar is
+just the set of `YYYY-MM-DD` stems in `bars_1m_raw/` — no SQL needed.
 
 **`eligibility_log.parquet` (persisted decisions, not re-derived).**
 For every (date, security_id) the engine considered, we write one row
@@ -528,9 +533,10 @@ rather than re-derive on demand:
 
 ### 6.1 Trading-day calendar
 
-Take the set of distinct ET-dates appearing in `bars_1m_raw/SPY.parquet`. Those
-are our trading days. This sidesteps the holidays-endpoint-is-only-forward
-limitation entirely.
+Take the set of `YYYY-MM-DD` filename stems in `bars_1m_raw/`. Those
+are our trading days. Per-day storage means the calendar falls out of
+`ls` — no SQL needed and the holidays-endpoint-is-only-forward
+limitation is moot.
 
 ### 6.2 Bar-boundary semantics (per spec)
 
@@ -631,7 +637,7 @@ A few things this snippet expresses that the C++ version did not:
 - **`session_bars` returns `Result<Session>`.** A missing or malformed bar file is a typed error (`StoreError::MissingBars { security_id, date }`), not a silent empty return. The signal scan continues with `?`-propagation; the daily loop logs and proceeds with the next security.
 - **`book.is_open(sid)` takes `&SecurityId`.** Passing a `DisplaySymbol` here is a compile error — the rename-continuity bug class (an entry registered under FB but the open-check done under META) cannot be expressed.
 
-**Symbol continuity across renames.** Because the engine keys positions, the path index, and `bars_1m` joins on `SecurityId` (composite FIGI), a mid-path rename (FB→META, share-class rejigs, etc.) is invisible to the daily loop: `bar_store.session_bars(sid, day)` resolves the affected display symbols via the rename chain (§4) and UNIONs the matching `bars_1m/{sym}.parquet` files. If the engine ever keyed on `DisplaySymbol` instead, every path would silently go empty after a rename date and the trade would look terminated when it wasn't. The newtype distinction makes this a type error rather than a runtime golden-test catch; golden test on FB→META in §8 stays as a belt-and-braces check.
+**Symbol continuity across renames.** Because the engine keys positions, the path index, and `bars_1m_raw` joins on `SecurityId` (composite FIGI), a mid-path rename (FB→META, share-class rejigs, etc.) is invisible to the daily loop: `bar_store.session_bars(sid, day)` resolves the affected display symbols via the rename chain (§4) and UNIONs the matching `bars_1m_raw/{sym}.parquet` files. If the engine ever keyed on `DisplaySymbol` instead, every path would silently go empty after a rename date and the trade would look terminated when it wasn't. The newtype distinction makes this a type error rather than a runtime golden-test catch; golden test on FB→META in §8 stays as a belt-and-braces check.
 
 ### 6.4 Exit logic (verbatim from spec — pin it in a single function)
 
@@ -911,7 +917,7 @@ descent" or a 09:50→10:00 sub-window check, not changes to Phase 0.
 
 ## 10. Downstream contract (Phase 1 sketch — schemas locked now, code later)
 
-Phase 0 ships two Parquet outputs and the `bars_1m/` cache. That's it
+Phase 0 ships two Parquet outputs and the `bars_1m_raw/` cache. That's it
 for Phase 0. **But the schema decisions made now lock in how cheap or
 expensive downstream agentic simulation work will be**, so we sketch the
 intended consumption shape here and use it to validate the schemas
@@ -982,27 +988,28 @@ re-pull. With flat files:
   raw 1-min on disk for free Phase 1 optionality (e.g. a 5-min
   variant, or intra-10-min giveback studies) — no S3 re-pull needed.
 
-### 11.2 Immutable raw + derived adjusted + sibling deltas (idempotent reruns)
+### 11.2 Immutable raw + sibling deltas (idempotent reruns)
 
-The split between `bars_1m_raw/` (immutable, per-ticker) and
-`bars_1m/` (derived adjusted) plus the sibling `bars_1m_deltas/`
-scheme collapses re-run cost to near-zero in common cases. Parquet is
-write-once, so we explicitly **never append** to per-ticker partitions
-day-by-day — that would force ~10k file rewrites every trading day.
-Instead:
+`bars_1m_raw/` is immutable per-ticker storage. Per decision 0a (§5.3)
+there is no derived adjusted directory — split adjustment is applied
+at read time by `BarReader` against the pinned `splits.parquet`
+snapshot. Parquet is write-once, so we explicitly **never append** to
+per-ticker partitions day-by-day — that would force ~10k file rewrites
+every trading day. Instead:
 
 - **New trading day** (the common case): download one flat file
   (~100 MB gz), write a single `bars_1m_deltas/YYYY-MM-DD.parquet`
   — one file, all tickers, 1-min rows passed through unchanged. The
-  bar reader's view UNIONs it in automatically (§5.1 step 4). The
-  adjustment kernel recomputes only `bars_1m/T` for tickers whose
-  values changed. No history re-downloaded, no per-ticker rewrites.
+  bar reader's view UNIONs it in automatically (§5.1 step 4). No
+  history re-downloaded, no per-ticker rewrites, no adjustment
+  recompute (the multiply runs at read time).
 - **Monthly compaction:** fold accumulated daily deltas back into
   per-ticker partitions in one batched pass (10k rewrites once a
   month, not 10k rewrites per day). Deterministic, idempotent, safe
   to interrupt.
-- **New split or dividend on ticker T:** recompute *only* `bars_1m/T`
-  from `bars_1m_raw/T` + the updated snapshot. CPU only, no network.
+- **New split on ticker T:** re-snapshot `splits.parquet` (one small
+  file rewrite, new `splits_snapshot_date` stamped in metadata) and
+  start a fresh backtest run against the new pin. No bar files touched.
 - **Backtest engine rerun (the most common operation):** zero ingest
   cost, ever — engine is a pure function of the cache.
 
@@ -1028,16 +1035,15 @@ Instead:
 - **Parquet compression:** Zstd level 3 for raw bars (better ratio
   than Snappy by ~25%, decode still fast). Snappy for the path
   join-index (tiny per row; decode speed matters more than ratio).
-- **Row-group sizing:** **128k rows per group** for `bars_1m_raw/{T}`.
-  Math: 10y × 252 trading days × ~390 one-minute bars = ~980k rows
-  per ticker (10× more than the old 10-min plan). 128k rows gives
-  ~7–8 row groups per ticker file, so a query for a specific 252-day
-  window (~98k rows) hits ~1 row group and skips the rest via min/max
-  stats on `t`. Going smaller than 128k at this row volume hurts
-  compression more than it helps pruning; 128k is the sweet spot.
-- **Sort within partition:** every per-ticker Parquet sorted by `t`
-  before write. Min/max stats become tight; predicate pushdown on
-  `t` ranges becomes O(log row-groups), not full scan.
+- **Row-group sizing:** **128k rows per group** for `bars_1m_raw/{day}`.
+  Math: ~5k tickers × ~390 one-minute bars = ~2M rows per daily file.
+  128k rows gives ~15 row groups per file. A `display_symbol == 'AAPL'`
+  query hits ~1 row group (AAPL's contiguous range) and skips the
+  rest via min/max stats on `display_symbol`.
+- **Sort within partition:** every per-day Parquet sorted by
+  `(display_symbol, t)` before write. Min/max stats on `display_symbol`
+  cluster each ticker into one row group; pushdown finds it without
+  scanning the rest.
 - **Secondary t-index for the path join:** the `per_trade_bar_path`
   parquet sorts by `(t, trade_id)` so the synchronized-clock replay
   (§10) is also a row-group-skip-friendly scan.
@@ -1047,8 +1053,9 @@ Instead:
 - **Per-call retry caching of REST responses on disk** — the REST
   surface is now too small for this to matter. SQLite cursor + idempotent
   fetch covers the rerun case.
-- **Parallel adjustment kernel** — single-threaded is fast enough on
-  raw flat-file data; we only adjust on snapshot change. Premature.
+- **Parallel read-time split multiply** — sub-millisecond per ticker
+  on the existing single-threaded path; parallelism would buy nothing
+  the engine actually waits on. Premature.
 - **Custom CSV parser for flat files** — Arrow's CSV reader is already
   vectorized and within 2× of hand-tuned. Not worth the bug surface.
 
@@ -1066,16 +1073,17 @@ that catch entire classes of bugs cheaply:
   (i.e., the drop is *visible*, not adjusted away). If the kernel
   silently dividend-adjusted bars, this property would fail — that's
   the catch.
-- **Per-file snapshot coherence:** for every `bars_1m/{T}.parquet`
-  and every split with execution date `E` affecting ticker `T`, assert
-  `file.splits_snapshot_date >= E`. (Per §5.3, files no longer need to
-  share a single snapshot date; the invariant is that each file is at
-  or ahead of every split it should already reflect.) Cheap pass at
-  engine startup.
-- **Flat-file coverage continuity:** the SPY ticker rows in
-  `bars_1m_raw/SPY` cover every trading day between
-  `min(date)` and `max(date)` with no gaps (the U.S. equity calendar
-  has no internal gaps; any gap = a missed flat-file download).
+- **Snapshot-pin coherence:** at engine startup, read
+  `splits_snapshot_date` from `splits.parquet`'s file-level metadata.
+  For every split row in the file, assert `execution_date <= pin`.
+  (Per decision 0a there is no per-bar-file stamp — raw bars are
+  immutable and have no adjustment basis to stamp. Enforcement lives
+  entirely on `splits.parquet`.) Cheap pass at engine startup;
+  `MaterializedBarReader::open` already does it.
+- **Flat-file coverage continuity:** SPY rows in `bars_1m_raw/*.parquet`
+  cover every trading day between `min(date)` and `max(date)` with no
+  gaps (the U.S. equity calendar has no internal gaps; any gap = a
+  missed flat-file download).
 
 ### 11.7 Field parity: flat files vs REST aggregates
 

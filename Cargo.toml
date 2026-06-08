@@ -13,6 +13,10 @@ members = [
     "bin/build-splits",
     "bin/build-dividends",
     "bin/build-ticker-events",
+    "bin/build-figi-map",
+    "bin/convert-staging",
+    "bin/verify-pivot",
+    "bin/audit-bars",
 ]
 
 [workspace.package]

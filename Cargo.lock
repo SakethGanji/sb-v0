@@ -319,6 +319,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "audit-bars"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "chrono",
+ "momentum-core",
+ "parquet",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -899,6 +910,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "build-figi-map"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "momentum-store",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "build-splits"
 version = "0.0.0"
 dependencies = [
@@ -1127,6 +1149,17 @@ dependencies = [
  "getrandom 0.2.17",
  "once_cell",
  "tiny-keccak",
+]
+
+[[package]]
+name = "convert-staging"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "momentum-store",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3991,6 +4024,16 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "verify-pivot"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "chrono",
+ "parquet",
+]
 
 [[package]]
 name = "version_check"

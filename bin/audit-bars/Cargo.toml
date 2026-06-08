@@ -1,0 +1,18 @@
+[package]
+name = "audit-bars"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "audit-bars"
+path = "src/main.rs"
+
+[dependencies]
+momentum-core.workspace = true
+anyhow = { workspace = true }
+arrow.workspace = true
+chrono.workspace = true
+parquet.workspace = true

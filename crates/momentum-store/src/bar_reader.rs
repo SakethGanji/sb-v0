@@ -2,6 +2,15 @@
 //! through. Applies split adjustment **at read time** against a pinned
 //! `splits.parquet` snapshot (§5.3 amended 2026-06-06).
 //!
+//! ## Storage shape
+//!
+//! Per-day Parquet files at `bars_dir/YYYY-MM-DD.parquet`, each
+//! containing every ticker's 1-min bars for that day, sorted by
+//! `(display_symbol, t)`. Matches the engine's day-major loop:
+//! `session_bars(sid, day)` opens one file per day, filters on
+//! `display_symbol`. Replaces an earlier per-ticker layout whose
+//! global-sort pivot was rejected.
+//!
 //! ## Contract
 //!
 //! Construction reads `splits.parquet`, extracts `splits_snapshot_date`
@@ -30,12 +39,16 @@
 //!
 //! ## Symbol resolution
 //!
-//! Today's resolver is a simple `HashMap<SecurityId, String>` of
-//! current display symbols. The rename-aware figi_map (derived from
-//! `ticker_events.parquet`) is task-10 — the API surface here doesn't
-//! change, only the resolver's behavior.
+//! Time-varying via `FigiMap` (built from `ticker_events.parquet`).
+//! `session_bars(sid, day)` resolves the sid → display_symbol for
+//! `day`, so a trade in a security that renamed (FB → META on
+//! 2022-06-09) reads the pre-rename file under "FB" and the post-rename
+//! file under "META" without the caller knowing. Sids missing from the
+//! map (~21% of active per measured coverage) fall back to using the
+//! sid string as the symbol so unconfigured runs don't 404 silently.
 
 use crate::WriteError;
+use crate::figi_map::FigiMap;
 use crate::splits::read_snapshot_date;
 use arrow::array::{Array, AsArray};
 use chrono::{Datelike, NaiveDate, TimeZone, Utc};
@@ -79,8 +92,9 @@ struct SplitFactor {
     factor: f64,
 }
 
-/// Materialized bar reader. Backed by per-ticker `bars_1m_raw/{T}.parquet`
-/// files and a once-loaded splits map.
+/// Materialized bar reader. Backed by per-day `bars_1m_raw/YYYY-MM-DD.parquet`
+/// files, a once-loaded splits map, and a time-varying FigiMap for
+/// rename-aware sid → display_symbol resolution.
 pub struct MaterializedBarReader {
     bars_dir: PathBuf,
     snapshot_pin: NaiveDate,
@@ -89,8 +103,8 @@ pub struct MaterializedBarReader {
     // Fallback: split factors keyed by current display symbol — for
     // rows in splits.parquet whose security_id was null at write time.
     splits_by_symbol: HashMap<String, Vec<SplitFactor>>,
-    // sid → current display symbol; used to locate the per-ticker file.
-    sid_to_symbol: HashMap<String, String>,
+    // sid → time-varying display_symbol resolver.
+    figi_map: FigiMap,
 }
 
 impl MaterializedBarReader {
@@ -99,7 +113,7 @@ impl MaterializedBarReader {
     pub fn open(
         bars_dir: &Path,
         splits_parquet: &Path,
-        sid_to_symbol: HashMap<String, String>,
+        figi_map: FigiMap,
     ) -> Result<Self, BarReaderError> {
         let snapshot_pin = read_snapshot_date(splits_parquet)?
             .ok_or(BarReaderError::MissingPin)?;
@@ -186,23 +200,21 @@ impl MaterializedBarReader {
             snapshot_pin,
             splits_by_sid,
             splits_by_symbol,
-            sid_to_symbol,
+            figi_map,
         })
     }
 
-    /// Resolve a security_id to the current display symbol. Today this
-    /// is current-only — task-10 will swap in time-varying rename
-    /// resolution via figi_map. Returns the sid string itself as a
-    /// last-resort fallback so an unconfigured map doesn't 404 silently.
-    fn resolve_symbol<'a>(&'a self, sid: &'a SecurityId) -> &'a str {
-        self.sid_to_symbol
-            .get(sid.as_str())
-            .map(String::as_str)
-            .unwrap_or(sid.as_str())
+    /// Resolve a security_id to the display symbol that was valid on
+    /// `day`. Falls back to the sid string itself if the figi_map has
+    /// no entry — keeps unconfigured runs from 404'ing silently, and
+    /// matches the engine's logged-fallback contract for the ~21% of
+    /// active sids missing FIGI coverage.
+    fn resolve_symbol<'a>(&'a self, sid: &'a SecurityId, day: NaiveDate) -> &'a str {
+        self.figi_map.resolve(sid, day).unwrap_or(sid.as_str())
     }
 
-    fn ticker_path(&self, symbol: &str) -> PathBuf {
-        self.bars_dir.join(format!("{symbol}.parquet"))
+    fn day_path(&self, day: NaiveDate) -> PathBuf {
+        self.bars_dir.join(format!("{day}.parquet"))
     }
 
     /// Cumulative split factor that converts raw price at time t to the
@@ -228,8 +240,8 @@ impl BarReader for MaterializedBarReader {
         sid: &SecurityId,
         day: NaiveDate,
     ) -> Result<Session, StoreError> {
-        let symbol = self.resolve_symbol(sid).to_string();
-        let path = self.ticker_path(&symbol);
+        let symbol = self.resolve_symbol(sid, day).to_string();
+        let path = self.day_path(day);
         let file = match File::open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -258,6 +270,10 @@ impl BarReader for MaterializedBarReader {
         for batch_res in reader {
             let batch = batch_res
                 .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+            let symbols = batch
+                .column_by_name("display_symbol")
+                .expect("display_symbol")
+                .as_string::<i32>();
             let t = batch
                 .column_by_name("t")
                 .expect("t column")
@@ -296,12 +312,14 @@ impl BarReader for MaterializedBarReader {
                 .expect("volume f64");
 
             for i in 0..batch.num_rows() {
+                if symbols.value(i) != symbol {
+                    continue;
+                }
                 let ts_ns = t.value(i);
                 let dt = Utc.timestamp_nanos(ts_ns);
-                // Filter to the requested day (UTC-naive day, since
-                // session-window filtering is the engine's job — we
-                // just need to cover the right calendar date).
                 let d = NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day()).expect("valid");
+                // Defense-in-depth: per-day file should only contain `day`'s rows,
+                // but a row spanning UTC midnight could land in the adjacent file.
                 if d != day {
                     continue;
                 }
@@ -330,6 +348,7 @@ impl BarReader for MaterializedBarReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::figi_map::FigiMapRow;
     use crate::splits::{SplitRow, write_splits};
     use arrow::array::{ArrayRef, Float64Array, RecordBatch, StringArray, TimestampNanosecondArray};
     use chrono::TimeZone;
@@ -339,6 +358,15 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
+    fn single_symbol_map(sid: &str, symbol: &str) -> FigiMap {
+        FigiMap::from_rows(vec![FigiMapRow {
+            security_id: sid.into(),
+            display_symbol: symbol.into(),
+            valid_from: None,
+            valid_to: None,
+        }])
+    }
+
     fn write_one_day_bars(
         dir: &Path,
         symbol: &str,
@@ -347,7 +375,7 @@ mod tests {
         prices: &[(f64, f64, f64, f64, f64)], // open, high, low, close, volume
     ) {
         std::fs::create_dir_all(dir).unwrap();
-        let path = dir.join(format!("{symbol}.parquet"));
+        let path = dir.join(format!("{day_str}.parquet"));
         let day = NaiveDate::parse_from_str(day_str, "%Y-%m-%d").unwrap();
         let schema = bars_1m_raw_schema();
         let n = prices.len();
@@ -415,7 +443,7 @@ mod tests {
         let reader = MaterializedBarReader::open(
             dir.path(),
             &splits,
-            HashMap::new(),
+            FigiMap::empty(),
         )
         .unwrap();
         assert_eq!(reader.snapshot_pin(), pin);
@@ -431,7 +459,7 @@ mod tests {
         let reader = MaterializedBarReader::open(
             dir.path(),
             &splits,
-            HashMap::new(),
+            FigiMap::empty(),
         )
         .unwrap();
         let factors = reader.splits_by_symbol.get("AAPL").unwrap();
@@ -460,9 +488,12 @@ mod tests {
             &[(400.0, 405.0, 398.0, 402.0, 1000.0)],
         );
 
-        let mut sid_map = HashMap::new();
-        sid_map.insert("BBG000B9XRY4".to_string(), "AAPL".to_string());
-        let reader = MaterializedBarReader::open(&bars_dir, &splits, sid_map).unwrap();
+        let reader = MaterializedBarReader::open(
+            &bars_dir,
+            &splits,
+            single_symbol_map("BBG000B9XRY4", "AAPL"),
+        )
+        .unwrap();
 
         let day = NaiveDate::from_ymd_opt(2020, 8, 28).unwrap();
         let sid = SecurityId::new("BBG000B9XRY4");
@@ -492,9 +523,12 @@ mod tests {
             &[raw],
         );
 
-        let mut sid_map = HashMap::new();
-        sid_map.insert("BBG000B9XRY4".into(), "AAPL".into());
-        let reader = MaterializedBarReader::open(&bars_dir, &splits, sid_map).unwrap();
+        let reader = MaterializedBarReader::open(
+            &bars_dir,
+            &splits,
+            single_symbol_map("BBG000B9XRY4", "AAPL"),
+        )
+        .unwrap();
 
         let day = NaiveDate::from_ymd_opt(2020, 8, 28).unwrap();
         let factors = reader.splits_by_sid.get("BBG000B9XRY4").unwrap();
@@ -539,7 +573,7 @@ mod tests {
             value: Some(pin.to_string()),
         };
 
-        let res = MaterializedBarReader::open(&bars_dir, &splits_path, HashMap::new());
+        let res = MaterializedBarReader::open(&bars_dir, &splits_path, FigiMap::empty());
         assert!(matches!(
             res,
             Err(BarReaderError::SnapshotViolation { .. })
@@ -563,7 +597,67 @@ mod tests {
         w.write(&empty).unwrap();
         let _ = w.close().unwrap();
 
-        let res = MaterializedBarReader::open(&bars_dir, &splits_path, HashMap::new());
+        let res = MaterializedBarReader::open(&bars_dir, &splits_path, FigiMap::empty());
         assert!(matches!(res, Err(BarReaderError::MissingPin)));
+    }
+
+    #[test]
+    fn session_bars_resolves_pre_and_post_rename() {
+        // FB→META on 2022-06-09. The same security_id has bars under
+        // "FB" on 2022-06-08 and under "META" on 2022-06-09. Both
+        // session_bars calls must succeed and return the right ticker's
+        // rows from each per-day file.
+        let dir = tempdir().unwrap();
+        let splits = dir.path().join("splits.parquet");
+        let bars_dir = dir.path().join("bars");
+        let pin = NaiveDate::from_ymd_opt(2026, 6, 7).unwrap();
+
+        // splits.parquet — none, but the writer still stamps the pin.
+        let figi = HashMap::new();
+        write_splits(&splits, &[], pin, &figi).unwrap();
+
+        write_one_day_bars(
+            &bars_dir,
+            "FB",
+            "BBG000MM2P62",
+            "2022-06-08",
+            &[(200.0, 201.0, 199.0, 200.5, 1000.0)],
+        );
+        write_one_day_bars(
+            &bars_dir,
+            "META",
+            "BBG000MM2P62",
+            "2022-06-09",
+            &[(210.0, 212.0, 209.0, 211.0, 1200.0)],
+        );
+
+        let map = FigiMap::from_rows(vec![
+            FigiMapRow {
+                security_id: "BBG000MM2P62".into(),
+                display_symbol: "FB".into(),
+                valid_from: Some(NaiveDate::from_ymd_opt(2012, 5, 18).unwrap()),
+                valid_to: Some(NaiveDate::from_ymd_opt(2022, 6, 9).unwrap()),
+            },
+            FigiMapRow {
+                security_id: "BBG000MM2P62".into(),
+                display_symbol: "META".into(),
+                valid_from: Some(NaiveDate::from_ymd_opt(2022, 6, 9).unwrap()),
+                valid_to: None,
+            },
+        ]);
+        let reader = MaterializedBarReader::open(&bars_dir, &splits, map).unwrap();
+
+        let sid = SecurityId::new("BBG000MM2P62");
+        let pre = reader
+            .session_bars(&sid, NaiveDate::from_ymd_opt(2022, 6, 8).unwrap())
+            .expect("pre-rename day");
+        assert_eq!(pre.len(), 1);
+        assert!((pre.bars[0].open - 200.0).abs() < 1e-9);
+
+        let post = reader
+            .session_bars(&sid, NaiveDate::from_ymd_opt(2022, 6, 9).unwrap())
+            .expect("post-rename day");
+        assert_eq!(post.len(), 1);
+        assert!((post.bars[0].open - 210.0).abs() < 1e-9);
     }
 }
