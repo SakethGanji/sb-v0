@@ -451,8 +451,19 @@ fn main() -> Result<()> {
         if valid > 0 {
             signal_share_history.push(fired as f64 / valid as f64);
         }
-        // Per-security rolling state.
+        // Per-security rolling state. Vendor data carries a handful of
+        // sid collisions (~16/day: one FIGI under two display symbols);
+        // pushing both would interleave two securities' histories into
+        // one trailing state. Ambiguous sids are skipped — their trailing
+        // columns stay honestly null instead of silently contaminated.
+        let mut seen: HashMap<&str, u32> = HashMap::with_capacity(sessions.len());
+        for s in &sessions {
+            *seen.entry(s.security_id.as_str()).or_default() += 1;
+        }
         for (s, agg) in sessions.iter().zip(&aggs) {
+            if seen[s.security_id.as_str()] > 1 {
+                continue;
+            }
             if let Some(agg) = agg {
                 rolling.update(s.security_id.as_str(), day, *agg);
             }

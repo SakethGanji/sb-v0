@@ -11,6 +11,7 @@ momentum-core = { workspace = true }
 momentum-api = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
+chrono-tz = { workspace = true }
 duckdb = { workspace = true }
 chrono = { workspace = true }
 flate2 = { workspace = true }

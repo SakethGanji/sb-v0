@@ -56,7 +56,10 @@ use crate::WriteError;
 use crate::figi_map::FigiMap;
 use crate::splits::read_snapshot_date;
 use arrow::array::{Array, AsArray};
-use chrono::{Datelike, NaiveDate, TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
+#[cfg(test)]
+use chrono::Datelike;
+use chrono_tz::America::New_York;
 use momentum_core::bar::Bar;
 use momentum_core::error::StoreError;
 use momentum_core::ids::SecurityId;
@@ -351,8 +354,9 @@ impl MaterializedBarReader {
             for i in 0..batch.num_rows() {
                 let ts_ns = t.value(i);
                 let dt = Utc.timestamp_nanos(ts_ns);
-                let d = NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day()).expect("valid");
-                // Same UTC-midnight defense as session_bars.
+                // Same ET-date session defense as session_bars (UTC
+                // comparison drops winter 19:00–20:00 ET bars).
+                let d = dt.with_timezone(&New_York).date_naive();
                 if d != day {
                     continue;
                 }
@@ -489,13 +493,16 @@ impl BarReader for MaterializedBarReader {
                 }
                 let ts_ns = t.value(i);
                 let dt = Utc.timestamp_nanos(ts_ns);
-                let d = NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day()).expect("valid");
-                // Defense-in-depth: per-day file should only contain `day`'s rows,
-                // but a row spanning UTC midnight could land in the adjacent file.
+                // Defense-in-depth: keep only rows belonging to `day`'s
+                // TRADING session. Compare in ET, not UTC — in winter,
+                // 19:00–20:00 ET after-hours bars carry the NEXT UTC date
+                // and a UTC comparison silently drops them (engine bug
+                // found by the independent validation suite).
+                let d = dt.with_timezone(&New_York).date_naive();
                 if d != day {
                     continue;
                 }
-                let f = Self::factor_at(factors, d);
+                let f = Self::factor_at(factors, day);
                 bars.push(Bar {
                     t: dt,
                     open: open.value(i) * f,

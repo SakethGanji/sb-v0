@@ -160,6 +160,50 @@ policies) are versioned outputs in the repo or `data/research/`.
 
 ---
 
+## 4.5 Validation plan (added 2026-06-11 after correctness review)
+
+Three verification levels; every engine output column must reach L2
+before the table it lives in is declared milestone-complete:
+
+- **L1 — Rust unit tests.** Hand-computed expectations. Necessary, not
+  sufficient: code and tests share an author (correlated blind spots).
+- **L2 — Independent recomputation.** `scripts/validate_phase0_outputs.py`:
+  a second implementation in polars, written from the column definitions,
+  recomputing from the raw tape and diffing the full cross-section.
+- **L3 — External ground truth.** Known market facts: real closes, VIX
+  prints, earnings dates, split ratios, SPY-beta-vs-itself ≡ 1.
+
+**Adjudication protocol (binding):** every L2 mismatch is root-caused to
+ENGINE or VALIDATOR by raw-tape inspection before any further table is
+built. Score so far: round 1 found 30 failure classes → 3 validator
+bugs, round 2 found 1 real engine bug (UTC-midnight defense dropped
+winter 19:00–20:00 ET bars — fixed) + 4 engine-vindicated semantics
+(auction close in RTH, sid-first split factors, adjusted-basis volumes,
+PM/AH-only rows kept) + 1 data-quality fact (16 vendor sid collisions
+per day, both rows preserved).
+
+**Plan:**
+
+1. **Per-milestone gate (standing rule):** each B-milestone extends the
+   validator to its new columns in the SAME commit — coverage never
+   trails the engine by more than one milestone.
+2. **Dedicated B1 validation session (next session, task #8):** extend
+   L2 to every not-yet-covered B1 column — remaining snapshots
+   (0940/0950/1010/1030), shape descriptors, ranks/percentiles,
+   Yang-Zhang (exact recompute), betas (exact), signal
+   freshness/concentration/HHI, gap-filled, days-since-move,
+   market_context index columns + 10m list contents, sector means
+   recomputed from obs + an independent SIC port — and run the battery
+   over stress days: a half day (2016-11-25), both DST transitions, a
+   rename day, a dup-sid day.
+3. **Cheap full-sweep property checks, every day swept:** rank
+   bijectivity, percentiles ∈ [0,1], high ≥ low, close within [low,
+   high], bar counts ≤ window sizes, uniform milestone stamps.
+4. **Golden-day fixtures (B6, unchanged):** hand-verified split
+   (AAPL 2020-08-31), rename (FB→META 2022-06-09), ex-div, LULD halt,
+   delisting days, once the full-window sweep exists.
+5. **Determinism check:** sweep the same day twice, byte-compare.
+
 ## 5. Risks & open decisions
 
 1. **Disk headroom** — decided by B0's measured bytes/day, not guessed.

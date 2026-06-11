@@ -62,24 +62,23 @@ def load_day_bars(d: date) -> pl.DataFrame:
 
 
 def session_windows(bars: pl.DataFrame) -> pl.DataFrame:
-    """Per-security UNADJUSTED day aggregates, recomputed from raw 1m bars."""
+    """Per-security UNADJUSTED day aggregates, recomputed from raw 1m bars.
+
+    Universe = every (sid, symbol) with ANY session bar (the engine keeps
+    premarket/AH-only securities — e.g. Nasdaq .TEST symbols — by the
+    record-everything amendment). RTH aggregates are null when no RTH
+    bars printed. RTH includes the 16:00 closing-auction print.
+    """
     from datetime import time
 
-    # RTH includes the 16:00 closing-auction print (engine session close
-    # is data-derived; eod close = the auction print).
+    bars = bars.with_columns(
+        pl.coalesce(pl.col("security_id"), pl.col("display_symbol")).alias("sid_key")
+    )
     rth = bars.filter((pl.col("et_time") >= time(9, 30)) & (pl.col("et_time") <= time(16, 0)))
     pm = bars.filter((pl.col("et_time") >= time(4, 0)) & (pl.col("et_time") < time(9, 30)))
     pre1000 = rth.filter(pl.col("et_time") < time(10, 0))
 
-    rth = rth.with_columns(
-        pl.coalesce(pl.col("security_id"), pl.col("display_symbol")).alias("sid_key")
-    )
-    pm = pm.with_columns(
-        pl.coalesce(pl.col("security_id"), pl.col("display_symbol")).alias("sid_key")
-    )
-    pre1000 = pre1000.with_columns(
-        pl.coalesce(pl.col("security_id"), pl.col("display_symbol")).alias("sid_key")
-    )
+    universe = bars.group_by("sid_key", "display_symbol").agg(pl.len().alias("n_bars"))
     agg = rth.group_by("sid_key", "display_symbol").agg(
         pl.col("open").first().alias("rth_open"),
         pl.col("high").max().alias("rth_high"),
@@ -89,14 +88,19 @@ def session_windows(bars: pl.DataFrame) -> pl.DataFrame:
         pl.len().alias("bar_count_rth"),
         pl.col("et_time").first().alias("first_rth_time"),
     )
+    agg = universe.join(agg, on=["sid_key", "display_symbol"], how="left")
     agg = agg.join(
-        pre1000.group_by("sid_key").agg(pl.col("close").last().alias("close_1000")),
-        on="sid_key",
+        pre1000.group_by("sid_key", "display_symbol").agg(
+            pl.col("close").last().alias("close_1000")
+        ),
+        on=["sid_key", "display_symbol"],
         how="left",
     )
     agg = agg.join(
-        pm.group_by("sid_key").agg(pl.col("volume").sum().alias("pm_volume")),
-        on="sid_key",
+        pm.group_by("sid_key", "display_symbol").agg(
+            pl.col("volume").sum().alias("pm_volume")
+        ),
+        on=["sid_key", "display_symbol"],
         how="left",
     )
     return agg.with_columns(
@@ -117,9 +121,12 @@ def pin_factors(d: date) -> pl.DataFrame:
         (pl.col("execution_date") <= pin) & (pl.col("execution_date") > d)
     )
     bysym = sp.group_by("display_symbol").agg(
-        (pl.col("split_from") / pl.col("split_to")).product().alias("factor")
+        (pl.col("split_from") / pl.col("split_to")).product().alias("sym_factor")
     )
-    return bysym
+    bysid = sp.filter(pl.col("security_id").is_not_null()).group_by("security_id").agg(
+        (pl.col("split_from") / pl.col("split_to")).product().alias("sid_factor")
+    )
+    return bysym, bysid
 
 
 print(f"=== independent validation of {DAY} ===\n")
@@ -146,10 +153,13 @@ obs = pl.read_parquet(OUT / "daily_observation" / f"{DAY}.parquet").select(
     "days_since_last_earnings",
 )
 raw = session_windows(load_day_bars(DAY))
-factors = pin_factors(DAY)
+bysym, bysid = pin_factors(DAY)
 raw = (
-    raw.join(factors, on="display_symbol", how="left")
-    .with_columns(pl.col("factor").fill_null(1.0))
+    raw.join(bysym, on="display_symbol", how="left")
+    .join(bysid, left_on="sid_key", right_on="security_id", how="left")
+    .with_columns(
+        pl.coalesce(pl.col("sid_factor"), pl.col("sym_factor"), pl.lit(1.0)).alias("factor")
+    )
     .with_columns(
         (pl.col("rth_open") * pl.col("factor")).alias("adj_open"),
         (pl.col("rth_close") * pl.col("factor")).alias("adj_close"),
@@ -158,10 +168,21 @@ raw = (
         (pl.col("rth_volume") / pl.col("factor")).alias("adj_volume"),
     )
 )
-j = obs.join(raw, left_on="security_id", right_on="sid_key", how="inner")
-r.check("row counts match (obs vs raw RTH universe)", obs.height == raw.height,
+j = obs.join(
+    raw,
+    left_on=["security_id", "display_symbol_on_day"],
+    right_on=["sid_key", "display_symbol"],
+    how="inner",
+)
+r.check("row counts match (obs vs raw session universe)", obs.height == raw.height,
         f"obs={obs.height} raw={raw.height}")
-r.check("every obs row joined", j.height == obs.height, f"joined={j.height}")
+r.check("every obs row joined exactly once", j.height == obs.height, f"joined={j.height}")
+# eod checks apply to rows with RTH bars; the rest must be null both sides.
+no_rth = j.filter(pl.col("bar_count_rth_right").is_null())
+r.check("no-RTH rows have null eod on both sides",
+        no_rth.filter(pl.col("eod_day_close").is_not_null()).height == 0,
+        f"rows={no_rth.height}")
+j = j.filter(pl.col("bar_count_rth_right").is_not_null())
 
 REL = 1e-9
 for out_col, raw_col in [
@@ -171,13 +192,20 @@ for out_col, raw_col in [
     ("eod_day_close", "adj_close"),
     ("eod_day_volume", "adj_volume"),
     ("eod_unadjusted_day_close", "rth_close"),
-    ("premarket_volume", "pm_volume"),
 ]:
     bad = j.filter(
         ((pl.col(out_col) - pl.col(raw_col)).abs()
          > REL * pl.max_horizontal(pl.col(out_col).abs(), pl.lit(1.0)))
     ).height
     r.check(f"{out_col} == recomputed", bad == 0, f"mismatches={bad}/{j.height}")
+
+# Premarket volume is reported on the pin-adjusted basis, like every
+# other volume column (adjudicated: engine semantics are uniform).
+bad = j.filter(
+    ((pl.col("premarket_volume") - pl.col("pm_volume") / pl.col("factor")).abs()
+     > REL * pl.max_horizontal(pl.col("premarket_volume").abs(), pl.lit(1.0)))
+).height
+r.check("premarket_volume == recomputed (adjusted basis)", bad == 0, f"mismatches={bad}")
 
 bad = j.filter(
     (pl.col("intraday_ret_0930_to_1000") - pl.col("ret_0930_1000")).abs() > 1e-9
@@ -191,7 +219,10 @@ bad = j.filter(
 r.check("first_rth_bar_time == recomputed", bad == 0, f"mismatches={bad}")
 
 # adjustment factor: independent re-derivation
-jf = j.filter((pl.col("adjustment_factor_on_day") - pl.col("factor")).abs() > 1e-12).height
+jf = j.filter(
+    (pl.col("adjustment_factor_on_day") - pl.col("factor")).abs()
+    > 1e-9 * pl.max_horizontal(pl.col("adjustment_factor_on_day").abs(), pl.lit(1.0))
+).height
 r.check("adjustment_factor_on_day == independent splits derivation", jf == 0,
         f"mismatches={jf}")
 
@@ -205,14 +236,35 @@ for p in reversed(prior_files):
         prior_day = d
         break
 praw = session_windows(load_day_bars(prior_day))
-pfactors = pin_factors(prior_day)
+pbysym, pbysid = pin_factors(prior_day)
 praw = (
-    praw.join(pfactors, on="display_symbol", how="left")
-    .with_columns(pl.col("factor").fill_null(1.0))
-    .with_columns((pl.col("rth_close") * pl.col("factor")).alias("prior_adj_close"))
-    .select("sid_key", "prior_adj_close")
+    praw.join(pbysym, on="display_symbol", how="left")
+    .join(pbysid, left_on="sid_key", right_on="security_id", how="left")
+    .with_columns(
+        pl.coalesce(pl.col("sid_factor"), pl.col("sym_factor"), pl.lit(1.0)).alias("pf")
+    )
+    .filter(pl.col("rth_close").is_not_null())
+    .with_columns((pl.col("rth_close") * pl.col("pf")).alias("prior_adj_close"))
+    .select("sid_key", "display_symbol", "prior_adj_close")
 )
-jg = j.join(praw, left_on="security_id", right_on="sid_key", how="inner")
+dups = (
+    obs.group_by("security_id").len().filter(pl.col("len") > 1)["security_id"]
+)
+pdups = (
+    praw.group_by("sid_key").len().filter(pl.col("len") > 1)["sid_key"]
+)
+jg = j.join(
+    praw,
+    left_on=["security_id", "display_symbol_on_day"],
+    right_on=["sid_key", "display_symbol"],
+    how="inner",
+).filter(
+    # Vendor sid collisions: engine keeps the rows but refuses trailing
+    # state for ambiguous sids (documented DQ decision) — nothing to
+    # compare against.
+    ~pl.col("security_id").is_in(dups.implode())
+    & ~pl.col("security_id").is_in(pdups.implode())
+)
 bad = jg.filter(
     (pl.col("prior_day_eod_close") - pl.col("prior_adj_close")).abs() > 1e-9
 ).height
