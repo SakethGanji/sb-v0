@@ -202,7 +202,6 @@ pub fn build(
     for r in rows {
         let hist = rolling.get(r.session.security_id.as_str());
         let prior = hist.and_then(|h| h.prior());
-        let prior_close = prior.map(|p| p.rth_close);
         // Primary: filed shares × unadjusted prior close (same basis at D).
         // Fallback: snapshot shares × adjusted prior close (see module doc).
         // Filed shares × unadjusted prior close, both on D's basis —
@@ -500,7 +499,7 @@ mod tests {
             crate::aggregates::compute(&s_prev.session, prev, et(prev, 9, 30), 1.0).unwrap(),
         );
 
-        let sessions = vec![
+        let sessions = [
             mk(day, "BBGCS", "CS1", 50.0),
             mk(day, "BBGETF", "LETF", 10.0),
             mk(day, "BBGW", "WTS", 1.5),
