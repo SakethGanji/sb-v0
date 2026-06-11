@@ -183,11 +183,11 @@ impl SecurityHistory {
             let cur = &self.days[i];
             if let (Some(a), Some(b)) =
                 (index_cumlog.get(&prev.day), index_cumlog.get(&cur.day))
+                && prev.rth_close > 0.0
+                && cur.rth_close > 0.0
             {
-                if prev.rth_close > 0.0 && cur.rth_close > 0.0 {
-                    xs.push(b - a);
-                    ys.push((cur.rth_close / prev.rth_close).ln());
-                }
+                xs.push(b - a);
+                ys.push((cur.rth_close / prev.rth_close).ln());
             }
         }
         if xs.len() < n * 3 / 4 {

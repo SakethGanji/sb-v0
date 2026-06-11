@@ -322,18 +322,18 @@ fn main() -> Result<()> {
         // ---- Push AFTER building: trailing reads stay [D-N, D-1]. ----
         // Index cum-log returns (uses rolling's prior close, pre-update).
         for (k, sym) in INDEX_SYMBOLS.iter().enumerate() {
-            if let Some(pos) = sessions.iter().position(|s| s.display_symbol == *sym) {
-                if let Some(agg) = &aggs[pos] {
-                    if let Some(pc) = rolling
-                        .get(sessions[pos].security_id.as_str())
-                        .and_then(|h| h.prior())
-                        .map(|p| p.rth_close)
-                        .filter(|pc| *pc > 0.0)
-                    {
-                        index_cum[k] += (agg.rth_close / pc).ln();
-                    }
-                    index_cumlog[k].insert(day, index_cum[k]);
+            if let Some(pos) = sessions.iter().position(|s| s.display_symbol == *sym)
+                && let Some(agg) = &aggs[pos]
+            {
+                if let Some(pc) = rolling
+                    .get(sessions[pos].security_id.as_str())
+                    .and_then(|h| h.prior())
+                    .map(|p| p.rth_close)
+                    .filter(|pc| *pc > 0.0)
+                {
+                    index_cum[k] += (agg.rth_close / pc).ln();
                 }
+                index_cumlog[k].insert(day, index_cum[k]);
             }
         }
         // Universe signal share (same definition as the builder's).
