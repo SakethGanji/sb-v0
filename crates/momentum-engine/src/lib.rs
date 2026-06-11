@@ -23,6 +23,7 @@ pub mod daily_observation;
 pub mod earnings;
 pub mod market_context;
 pub mod rolling;
+pub mod sector;
 pub mod sic;
 pub mod slices;
 pub mod stamps;

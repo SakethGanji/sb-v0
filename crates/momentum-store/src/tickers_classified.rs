@@ -251,6 +251,90 @@ pub fn read_snapshot_date(path: &Path) -> Result<Option<NaiveDate>, WriteError> 
     Ok(None)
 }
 
+/// The classification-relevant slice of one tickers_classified row —
+/// what the engine's sector/classification layers need.
+#[derive(Debug, Clone)]
+pub struct ClassifiedLite {
+    pub security_id: Option<String>,
+    pub display_symbol: String,
+    pub ticker_type: Option<String>,
+    pub primary_exchange: Option<String>,
+    pub locale: Option<String>,
+    pub list_date: Option<NaiveDate>,
+    pub sic_code: Option<String>,
+    pub sic_description: Option<String>,
+    pub market_cap_snapshot: Option<f64>,
+    pub weighted_shares_outstanding_snapshot: Option<f64>,
+}
+
+/// Read the classification-relevant columns from
+/// `tickers_classified.parquet`.
+pub fn read_classified_lite(path: &Path) -> Result<Vec<ClassifiedLite>, WriteError> {
+    use arrow::array::{Array, AsArray};
+    use arrow::compute::cast;
+    use arrow::datatypes::{DataType, Date32Type, Float64Type};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = File::open(path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let mut out = Vec::new();
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
+
+    for batch_res in reader {
+        let batch = batch_res?;
+        let utf8 = |name: &str| -> Result<arrow::array::ArrayRef, WriteError> {
+            Ok(cast(batch.column_by_name(name).expect(name), &DataType::Utf8)?)
+        };
+        let sid = utf8("security_id")?;
+        let sid = sid.as_string::<i32>();
+        let symbol = utf8("display_symbol")?;
+        let symbol = symbol.as_string::<i32>();
+        let ticker_type = utf8("ticker_type")?;
+        let ticker_type = ticker_type.as_string::<i32>();
+        let exchange = utf8("primary_exchange")?;
+        let exchange = exchange.as_string::<i32>();
+        let locale = utf8("locale")?;
+        let locale = locale.as_string::<i32>();
+        let sic_code = utf8("sic_code")?;
+        let sic_code = sic_code.as_string::<i32>();
+        let sic_desc = utf8("sic_description")?;
+        let sic_desc = sic_desc.as_string::<i32>();
+        let list_date = batch
+            .column_by_name("list_date")
+            .expect("list_date")
+            .as_primitive::<Date32Type>();
+        let mcap = batch
+            .column_by_name("market_cap_snapshot")
+            .expect("market_cap_snapshot")
+            .as_primitive::<Float64Type>();
+        let shares = batch
+            .column_by_name("weighted_shares_outstanding_snapshot")
+            .expect("weighted_shares_outstanding_snapshot")
+            .as_primitive::<Float64Type>();
+
+        let opt_str = |arr: &arrow::array::StringArray, i: usize| {
+            (!arr.is_null(i)).then(|| arr.value(i).to_string())
+        };
+        for i in 0..batch.num_rows() {
+            out.push(ClassifiedLite {
+                security_id: opt_str(sid, i),
+                display_symbol: symbol.value(i).to_string(),
+                ticker_type: opt_str(ticker_type, i),
+                primary_exchange: opt_str(exchange, i),
+                locale: opt_str(locale, i),
+                list_date: (!list_date.is_null(i))
+                    .then(|| epoch + chrono::Duration::days(list_date.value(i) as i64)),
+                sic_code: opt_str(sic_code, i),
+                sic_description: opt_str(sic_desc, i),
+                market_cap_snapshot: (!mcap.is_null(i)).then(|| mcap.value(i)),
+                weighted_shares_outstanding_snapshot: (!shares.is_null(i))
+                    .then(|| shares.value(i)),
+            });
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

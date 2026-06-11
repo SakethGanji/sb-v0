@@ -22,17 +22,21 @@
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use momentum_calendar::Calendar;
-use momentum_core::phase0_outputs::{daily_observation_schema, market_context_daily_schema};
+use momentum_core::phase0_outputs::{
+    daily_observation_schema, market_context_daily_schema, sector_aggregates_daily_schema,
+};
 use momentum_engine::cursor::EngineCursor;
 use momentum_engine::daily_observation::{self, DayContext, RowInput};
 use momentum_engine::earnings::EarningsLookup;
 use momentum_engine::market_context::{self, IndexDay, UniverseSnapshot};
 use momentum_engine::rolling::RollingState;
+use momentum_engine::sector::{self, SectorRowInput};
 use momentum_engine::slices::{et, slice};
-use momentum_engine::{aggregates, stamps};
+use momentum_engine::{aggregates, sic, stamps};
 use momentum_store::bar_reader::{DaySession, MaterializedBarReader};
 use momentum_store::dividends::read_ex_dividend_dates;
 use momentum_store::figi_map::FigiMap;
+use momentum_store::tickers_classified::read_classified_lite;
 use momentum_store::vix::read_vix_closes;
 use parquet::arrow::ArrowWriter;
 use std::collections::HashMap;
@@ -48,6 +52,8 @@ const OBS_MILESTONE_WITH_EARNINGS: &str = "B2";
 const OBS_MILESTONE_NO_EARNINGS: &str = "B1-partial";
 const CTX_TABLE: &str = "market_context_daily";
 const CTX_MILESTONE: &str = "B1";
+const SECTOR_TABLE: &str = "sector_aggregates_daily";
+const SECTOR_MILESTONE: &str = "B2";
 /// "Split nearby" = execution date within ±3 calendar days of D
 /// (documented definition; the RFC leaves the window unspecified).
 const SPLIT_NEARBY_CAL_DAYS: i64 = 3;
@@ -167,6 +173,31 @@ fn main() -> Result<()> {
     } else {
         OBS_MILESTONE_NO_EARNINGS
     };
+    // sid/symbol → sector via the SIC v1 mapping (snapshot taxonomy —
+    // documented proxy; see momentum_engine::sector docs).
+    let sector_by_key: HashMap<String, &'static str> = {
+        match read_classified_lite(&args.reference.join("tickers_classified.parquet")) {
+            Ok(rows) => {
+                let mut m = HashMap::new();
+                for r in &rows {
+                    if let Some(sector) =
+                        r.sic_code.as_deref().and_then(|c| sic::sector_industry(c).0)
+                    {
+                        if let Some(sid) = &r.security_id {
+                            m.insert(sid.clone(), sector);
+                        }
+                        m.insert(r.display_symbol.clone(), sector);
+                    }
+                }
+                println!("sector map: {} keys", m.len());
+                m
+            }
+            Err(e) => {
+                tracing::warn!(%e, "tickers_classified.parquet unavailable — sectors will be Unknown");
+                HashMap::new()
+            }
+        }
+    };
 
     let days: Vec<NaiveDate> = calendar
         .trading_days()
@@ -193,6 +224,7 @@ fn main() -> Result<()> {
 
     let obs_dir = args.out.join(OBS_TABLE);
     let ctx_dir = args.out.join(CTX_TABLE);
+    let sector_dir = args.out.join(SECTOR_TABLE);
     let mut rolling = RollingState::new();
     // Index cum-log close returns, one map per [SPY, QQQ, IWM].
     let mut index_cumlog: [HashMap<NaiveDate, f64>; 3] = Default::default();
@@ -215,8 +247,27 @@ fn main() -> Result<()> {
             .map(|(s, f)| aggregates::compute(&s.session, day, session_close, *f))
             .collect();
 
+        // Shared per-security snapshot returns at 09:50 / 10:30
+        // (the 10:00 one lives in DailyAgg).
+        let extra_rets: Vec<(Option<f64>, Option<f64>)> = sessions
+            .iter()
+            .zip(&aggs)
+            .map(|(s, agg)| {
+                let open = agg.map(|a| a.rth_open).filter(|o| *o > 0.0);
+                let rth_open_t = et(day, 9, 30);
+                let r = |h: u32, m: u32| {
+                    slice(&s.session.bars, rth_open_t, et(day, h, m))
+                        .last()
+                        .zip(open)
+                        .map(|(l, o)| l.close / o - 1.0)
+                };
+                (r(9, 50), r(10, 30))
+            })
+            .collect();
+
         let obs_done = cursor.is_done(OBS_TABLE, day)? && !args.force;
         let ctx_done = cursor.is_done(CTX_TABLE, day)? && !args.force;
+        let sector_done = cursor.is_done(SECTOR_TABLE, day)? && !args.force;
 
         if !obs_done {
             let rows: Vec<RowInput<'_>> = sessions
@@ -272,17 +323,10 @@ fn main() -> Result<()> {
             let universe: Vec<UniverseSnapshot> = sessions
                 .iter()
                 .zip(&aggs)
-                .map(|(s, agg)| {
+                .zip(&extra_rets)
+                .map(|((s, agg), (_, ret_1030))| {
                     let hist = rolling.get(s.security_id.as_str());
-                    let bars = &s.session.bars;
-                    let rth_open_t = et(day, 9, 30);
-                    let ret_1030 = slice(bars, rth_open_t, et(day, 10, 30))
-                        .last()
-                        .and_then(|l| {
-                            agg.map(|a| a.rth_open)
-                                .filter(|o| *o > 0.0)
-                                .map(|o| l.close / o - 1.0)
-                        });
+                    let ret_1030 = *ret_1030;
                     let ret_1000 = agg.and_then(|a| a.snapshot_ret_1000);
                     let px_1000 = agg
                         .map(|a| a.rth_open)
@@ -348,6 +392,36 @@ fn main() -> Result<()> {
                 CTX_MILESTONE,
             )?;
             cursor.mark_done(CTX_TABLE, day)?;
+        }
+
+        if !sector_done {
+            let inputs: Vec<SectorRowInput<'_>> = sessions
+                .iter()
+                .zip(&aggs)
+                .zip(&extra_rets)
+                .map(|((s, agg), (ret_0950, ret_1030))| SectorRowInput {
+                    sector: sector_by_key
+                        .get(s.security_id.as_str())
+                        .or_else(|| sector_by_key.get(&s.display_symbol))
+                        .copied(),
+                    ret_0950: *ret_0950,
+                    ret_1000: agg.and_then(|a| a.snapshot_ret_1000),
+                    ret_1030: *ret_1030,
+                    eod_ret: agg
+                        .filter(|a| a.rth_open > 0.0)
+                        .map(|a| a.rth_close / a.rth_open - 1.0),
+                })
+                .collect();
+            let batch = sector::build(day, &inputs)?;
+            write_table(
+                &sector_dir,
+                day,
+                sector_aggregates_daily_schema(),
+                &batch,
+                &[],
+                SECTOR_MILESTONE,
+            )?;
+            cursor.mark_done(SECTOR_TABLE, day)?;
         }
 
         // ---- Push AFTER building: trailing reads stay [D-N, D-1]. ----
