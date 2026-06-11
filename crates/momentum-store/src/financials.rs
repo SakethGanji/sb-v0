@@ -225,6 +225,9 @@ pub struct FilingLite {
     pub timeframe: Option<String>,
     pub fiscal_period: Option<String>,
     pub fiscal_year: Option<String>,
+    /// Point-in-time share count from the filing (basic average shares
+    /// for the period) — the split-consistent market-cap input.
+    pub basic_average_shares: Option<f64>,
 }
 
 /// Read the filing-identity columns from `financials.parquet`.
@@ -264,6 +267,10 @@ pub fn read_filings_lite(path: &Path) -> Result<Vec<FilingLite>, WriteError> {
             .column_by_name("acceptance_datetime")
             .expect("acceptance_datetime")
             .as_primitive::<TimestampNanosecondType>();
+        let shares = batch
+            .column_by_name("basic_average_shares")
+            .expect("basic_average_shares")
+            .as_primitive::<arrow::datatypes::Float64Type>();
 
         let opt_str = |arr: &arrow::array::StringArray, i: usize| {
             (!arr.is_null(i)).then(|| arr.value(i).to_string())
@@ -280,6 +287,7 @@ pub fn read_filings_lite(path: &Path) -> Result<Vec<FilingLite>, WriteError> {
                 timeframe: opt_str(timeframe, i),
                 fiscal_period: opt_str(fiscal_period, i),
                 fiscal_year: opt_str(fiscal_year, i),
+                basic_average_shares: (!shares.is_null(i)).then(|| shares.value(i)),
             });
         }
     }

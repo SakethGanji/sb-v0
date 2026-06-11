@@ -10,6 +10,7 @@ publish.workspace = true
 momentum-core = { workspace = true }
 momentum-store = { workspace = true }
 momentum-calendar = { workspace = true }
+momentum-classify = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 chrono = { workspace = true }

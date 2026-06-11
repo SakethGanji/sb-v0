@@ -28,6 +28,7 @@ members = [
     "bin/build-edgar-acceptance",
     "bin/write-phase0",
     "bin/build-earnings-calendar",
+    "bin/build-regimes",
 ]
 
 [workspace.package]

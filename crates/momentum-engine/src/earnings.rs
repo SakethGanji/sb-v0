@@ -323,6 +323,7 @@ mod tests {
                 timeframe: Some(timeframe.into()),
                 fiscal_period: Some(fp.into()),
                 fiscal_year: Some(fy.into()),
+                basic_average_shares: None,
             }
         }
     }

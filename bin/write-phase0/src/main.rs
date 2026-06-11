@@ -25,6 +25,7 @@ use momentum_calendar::Calendar;
 use momentum_core::phase0_outputs::{
     daily_observation_schema, market_context_daily_schema, sector_aggregates_daily_schema,
 };
+use momentum_engine::classification::{self, ClassificationRow, SharesLookup};
 use momentum_engine::cursor::EngineCursor;
 use momentum_engine::daily_observation::{self, DayContext, RowInput};
 use momentum_engine::earnings::EarningsLookup;
@@ -36,7 +37,7 @@ use momentum_engine::{aggregates, sic, stamps};
 use momentum_store::bar_reader::{DaySession, MaterializedBarReader};
 use momentum_store::dividends::read_ex_dividend_dates;
 use momentum_store::figi_map::FigiMap;
-use momentum_store::tickers_classified::read_classified_lite;
+use momentum_store::tickers_classified::{ClassifiedLite, read_classified_lite};
 use momentum_store::vix::read_vix_closes;
 use parquet::arrow::ArrowWriter;
 use std::collections::HashMap;
@@ -54,6 +55,8 @@ const CTX_TABLE: &str = "market_context_daily";
 const CTX_MILESTONE: &str = "B1";
 const SECTOR_TABLE: &str = "sector_aggregates_daily";
 const SECTOR_MILESTONE: &str = "B2";
+const CLASS_TABLE: &str = "security_classification_daily";
+const CLASS_MILESTONE: &str = "B2";
 /// "Split nearby" = execution date within ±3 calendar days of D
 /// (documented definition; the RFC leaves the window unspecified).
 const SPLIT_NEARBY_CAL_DAYS: i64 = 3;
@@ -173,29 +176,59 @@ fn main() -> Result<()> {
     } else {
         OBS_MILESTONE_NO_EARNINGS
     };
+    // Reference rows (CS-only on disk — ticker_type is null for the
+    // ~70% of the bars universe never ingested; documented coverage gap,
+    // fix = re-pull tickers without the CS filter, deferred-ingest list).
+    let classified: Vec<ClassifiedLite> =
+        match read_classified_lite(&args.reference.join("tickers_classified.parquet")) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(%e, "tickers_classified.parquet unavailable — classification will be sparse");
+                Vec::new()
+            }
+        };
+    // sid AND current-symbol keys → row index (sid wins on collision).
+    let classified_idx: HashMap<&str, usize> = {
+        let mut m: HashMap<&str, usize> = HashMap::new();
+        for (i, r) in classified.iter().enumerate() {
+            m.entry(r.display_symbol.as_str()).or_insert(i);
+        }
+        for (i, r) in classified.iter().enumerate() {
+            if let Some(sid) = &r.security_id {
+                m.insert(sid.as_str(), i);
+            }
+        }
+        m
+    };
     // sid/symbol → sector via the SIC v1 mapping (snapshot taxonomy —
     // documented proxy; see momentum_engine::sector docs).
     let sector_by_key: HashMap<String, &'static str> = {
-        match read_classified_lite(&args.reference.join("tickers_classified.parquet")) {
-            Ok(rows) => {
-                let mut m = HashMap::new();
-                for r in &rows {
-                    if let Some(sector) =
-                        r.sic_code.as_deref().and_then(|c| sic::sector_industry(c).0)
-                    {
-                        if let Some(sid) = &r.security_id {
-                            m.insert(sid.clone(), sector);
-                        }
-                        m.insert(r.display_symbol.clone(), sector);
-                    }
+        let mut m = HashMap::new();
+        for r in &classified {
+            if let Some(sector) = r.sic_code.as_deref().and_then(|c| sic::sector_industry(c).0) {
+                if let Some(sid) = &r.security_id {
+                    m.insert(sid.clone(), sector);
                 }
-                println!("sector map: {} keys", m.len());
-                m
+                m.insert(r.display_symbol.clone(), sector);
             }
-            Err(e) => {
-                tracing::warn!(%e, "tickers_classified.parquet unavailable — sectors will be Unknown");
-                HashMap::new()
-            }
+        }
+        println!("sector map: {} keys | classified rows: {}", m.len(), classified.len());
+        m
+    };
+    let dataset_start = calendar.trading_days()[0];
+    // Point-in-time share counts for market cap (filed shares × unadjusted
+    // prior close — see momentum_engine::classification docs).
+    let shares = match momentum_store::financials::read_filings_lite(
+        &args.reference.join("financials.parquet"),
+    ) {
+        Ok(filings) => {
+            let lk = SharesLookup::from_filings(&filings);
+            println!("shares lookup: {} securities", lk.securities());
+            Some(lk)
+        }
+        Err(e) => {
+            tracing::warn!(%e, "financials.parquet unavailable — market_cap falls back to snapshot shares");
+            None
         }
     };
 
@@ -225,6 +258,7 @@ fn main() -> Result<()> {
     let obs_dir = args.out.join(OBS_TABLE);
     let ctx_dir = args.out.join(CTX_TABLE);
     let sector_dir = args.out.join(SECTOR_TABLE);
+    let class_dir = args.out.join(CLASS_TABLE);
     let mut rolling = RollingState::new();
     // Index cum-log close returns, one map per [SPY, QQQ, IWM].
     let mut index_cumlog: [HashMap<NaiveDate, f64>; 3] = Default::default();
@@ -249,7 +283,7 @@ fn main() -> Result<()> {
 
         // Shared per-security snapshot returns at 09:50 / 10:30
         // (the 10:00 one lives in DailyAgg).
-        let extra_rets: Vec<(Option<f64>, Option<f64>)> = sessions
+        let extra_rets: Vec<(Option<f64>, Option<f64>, Option<f64>)> = sessions
             .iter()
             .zip(&aggs)
             .map(|(s, agg)| {
@@ -261,13 +295,21 @@ fn main() -> Result<()> {
                         .zip(open)
                         .map(|(l, o)| l.close / o - 1.0)
                 };
-                (r(9, 50), r(10, 30))
+                let w = slice(&s.session.bars, rth_open_t, et(day, 10, 0));
+                let dvol_1000 = (!w.is_empty())
+                    .then(|| w.iter().map(|b| b.close * b.volume).sum::<f64>());
+                (r(9, 50), r(10, 30), dvol_1000)
             })
             .collect();
 
         let obs_done = cursor.is_done(OBS_TABLE, day)? && !args.force;
         let ctx_done = cursor.is_done(CTX_TABLE, day)? && !args.force;
         let sector_done = cursor.is_done(SECTOR_TABLE, day)? && !args.force;
+        let class_done = cursor.is_done(CLASS_TABLE, day)? && !args.force;
+        let day_ctx = DayContext {
+            index_cumlog: [&index_cumlog[0], &index_cumlog[1], &index_cumlog[2]],
+            signal_share_history: &signal_share_history,
+        };
 
         if !obs_done {
             let rows: Vec<RowInput<'_>> = sessions
@@ -300,10 +342,6 @@ fn main() -> Result<()> {
                         .and_then(|lk| lk.on_day(s.security_id.as_str(), day).1.map(String::from)),
                 })
                 .collect();
-            let day_ctx = DayContext {
-                index_cumlog: [&index_cumlog[0], &index_cumlog[1], &index_cumlog[2]],
-                signal_share_history: &signal_share_history,
-            };
             let batch = daily_observation::build(day, &rows, session_close, &rolling, &day_ctx)?;
             write_table(
                 &obs_dir,
@@ -324,7 +362,7 @@ fn main() -> Result<()> {
                 .iter()
                 .zip(&aggs)
                 .zip(&extra_rets)
-                .map(|((s, agg), (_, ret_1030))| {
+                .map(|((s, agg), (_, ret_1030, _))| {
                     let hist = rolling.get(s.security_id.as_str());
                     let ret_1030 = *ret_1030;
                     let ret_1000 = agg.and_then(|a| a.snapshot_ret_1000);
@@ -399,7 +437,7 @@ fn main() -> Result<()> {
                 .iter()
                 .zip(&aggs)
                 .zip(&extra_rets)
-                .map(|((s, agg), (ret_0950, ret_1030))| SectorRowInput {
+                .map(|((s, agg), (ret_0950, ret_1030, _))| SectorRowInput {
                     sector: sector_by_key
                         .get(s.security_id.as_str())
                         .or_else(|| sector_by_key.get(&s.display_symbol))
@@ -422,6 +460,37 @@ fn main() -> Result<()> {
                 SECTOR_MILESTONE,
             )?;
             cursor.mark_done(SECTOR_TABLE, day)?;
+        }
+
+        if !class_done {
+            let rows: Vec<ClassificationRow<'_>> = sessions
+                .iter()
+                .zip(&aggs)
+                .zip(&extra_rets)
+                .map(|((s, agg), (_, _, dvol_1000))| ClassificationRow {
+                    session: s,
+                    agg: *agg,
+                    dvol_0930_1000: *dvol_1000,
+                    reference: classified_idx
+                        .get(s.security_id.as_str())
+                        .or_else(|| classified_idx.get(s.display_symbol.as_str()))
+                        .map(|&i| &classified[i]),
+                    shares_asof: shares.as_ref().and_then(|lk| {
+                        lk.as_of(s.security_id.as_str(), day)
+                            .or_else(|| lk.as_of(&s.display_symbol, day))
+                    }),
+                })
+                .collect();
+            let batch = classification::build(day, &rows, &rolling, &day_ctx, dataset_start)?;
+            write_table(
+                &class_dir,
+                day,
+                momentum_core::phase0_outputs::security_classification_daily_schema(),
+                &batch,
+                &stamps::security_classification_daily_stamps(),
+                CLASS_MILESTONE,
+            )?;
+            cursor.mark_done(CLASS_TABLE, day)?;
         }
 
         // ---- Push AFTER building: trailing reads stay [D-N, D-1]. ----

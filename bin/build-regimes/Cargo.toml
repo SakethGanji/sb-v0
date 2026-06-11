@@ -1,0 +1,19 @@
+[package]
+name = "build-regimes"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "build-regimes"
+path = "src/main.rs"
+
+[dependencies]
+momentum-core.workspace = true
+momentum-engine.workspace = true
+anyhow = { workspace = true }
+arrow.workspace = true
+parquet.workspace = true
+chrono.workspace = true
