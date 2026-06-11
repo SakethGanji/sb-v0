@@ -14,10 +14,15 @@
 //! ## Contract
 //!
 //! Construction reads `splits.parquet`, extracts `splits_snapshot_date`
-//! from file-level Parquet metadata, and refuses any split row whose
-//! `execution_date > snapshot_pin`. This is the only place that
-//! enforcement lives — once `MaterializedBarReader` exists, the
-//! invariant holds for the lifetime of the run.
+//! from file-level Parquet metadata, and **excludes** any split row whose
+//! `execution_date > snapshot_pin` from the factor tables (with a warn
+//! log). Vendor snapshots legitimately contain announced-but-not-yet-
+//! executed splits; those are not in the tape as of the pin basis, so
+//! letting them into `factor_at` would mis-adjust every historical bar.
+//! Exclusion is the only treatment consistent with the single-adjustment-
+//! baseline decision. This is the only place that enforcement lives —
+//! once `MaterializedBarReader` exists, the invariant holds for the
+//! lifetime of the run.
 //!
 //! `session_bars(sid, day)` returns the day's bars **already adjusted**:
 //!
@@ -73,14 +78,17 @@ pub enum BarReaderError {
     Arrow(#[from] arrow::error::ArrowError),
     #[error("splits.parquet missing `splits_snapshot_date` metadata key — refusing to build a reader with no pin")]
     MissingPin,
-    #[error(
-        "splits row violates snapshot pin: ticker={ticker} execution_date={execution_date} > pin={pin}"
-    )]
-    SnapshotViolation {
-        ticker: String,
-        execution_date: NaiveDate,
-        pin: NaiveDate,
-    },
+    #[error("missing day file: {0}")]
+    MissingDay(NaiveDate),
+}
+
+/// One security's full session for a day, as returned by the bulk
+/// [`MaterializedBarReader::day_sessions`] read.
+#[derive(Debug)]
+pub struct DaySession {
+    pub security_id: SecurityId,
+    pub display_symbol: String,
+    pub session: Session,
 }
 
 /// One split's adjustment effect, pre-extracted from `splits.parquet`.
@@ -149,15 +157,16 @@ impl MaterializedBarReader {
                 let exec = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()
                     + chrono::Duration::days(dates.value(i) as i64);
                 if exec > snapshot_pin {
-                    return Err(BarReaderError::SnapshotViolation {
-                        ticker: if sids.is_null(i) {
-                            symbols.value(i).to_string()
-                        } else {
-                            sids.value(i).to_string()
-                        },
-                        execution_date: exec,
-                        pin: snapshot_pin,
-                    });
+                    // Announced-but-not-executed split (vendor snapshots
+                    // include these). Not in the tape as of the pin basis
+                    // — must NOT contribute to adjustment.
+                    tracing::warn!(
+                        ticker = symbols.value(i),
+                        execution_date = %exec,
+                        pin = %snapshot_pin,
+                        "future-dated split excluded from adjustment"
+                    );
+                    continue;
                 }
                 let f_from = from.value(i);
                 let f_to = to.value(i);
@@ -227,6 +236,128 @@ impl MaterializedBarReader {
             }
         }
         f
+    }
+
+    /// Bulk read: every security's session for `day` in ONE scan of the
+    /// per-day file, split-adjusted. This is the engine's read path —
+    /// `session_bars` re-scans the whole file per sid, which is fine for
+    /// audits/backfills but O(names²) inside a day-major engine loop.
+    ///
+    /// Rows with a null `security_id` fall back to the display symbol as
+    /// the sid, mirroring `resolve_symbol`'s logged-fallback contract.
+    /// Output is sorted by display_symbol (the file's native order).
+    pub fn day_sessions(&self, day: NaiveDate) -> Result<Vec<DaySession>, BarReaderError> {
+        let path = self.day_path(day);
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BarReaderError::MissingDay(day));
+            }
+            Err(e) => return Err(BarReaderError::Io(e)),
+        };
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+
+        // (display_symbol, sid) → bars. BTreeMap keeps the output in the
+        // file's (display_symbol, t) order without a separate sort; the
+        // map also tolerates a symbol's rows spanning batch boundaries.
+        let mut by_key: std::collections::BTreeMap<(String, String), Vec<Bar>> =
+            std::collections::BTreeMap::new();
+
+        for batch_res in reader {
+            let batch = batch_res?;
+            let sids = batch.column_by_name("security_id").expect("security_id").as_string::<i32>();
+            let symbols = batch
+                .column_by_name("display_symbol")
+                .expect("display_symbol")
+                .as_string::<i32>();
+            let t = batch
+                .column_by_name("t")
+                .expect("t column")
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+                .expect("t timestamp");
+            let open = batch
+                .column_by_name("open")
+                .expect("open")
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .expect("open f64");
+            let high = batch
+                .column_by_name("high")
+                .expect("high")
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .expect("high f64");
+            let low = batch
+                .column_by_name("low")
+                .expect("low")
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .expect("low f64");
+            let close = batch
+                .column_by_name("close")
+                .expect("close")
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .expect("close f64");
+            let volume = batch
+                .column_by_name("volume")
+                .expect("volume")
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .expect("volume f64");
+
+            for i in 0..batch.num_rows() {
+                let ts_ns = t.value(i);
+                let dt = Utc.timestamp_nanos(ts_ns);
+                let d = NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day()).expect("valid");
+                // Same UTC-midnight defense as session_bars.
+                if d != day {
+                    continue;
+                }
+                let symbol = symbols.value(i);
+                let sid = if sids.is_null(i) { symbol } else { sids.value(i) };
+                by_key
+                    .entry((symbol.to_string(), sid.to_string()))
+                    .or_default()
+                    .push(Bar {
+                        t: dt,
+                        open: open.value(i),
+                        high: high.value(i),
+                        low: low.value(i),
+                        close: close.value(i),
+                        volume: volume.value(i),
+                    });
+            }
+        }
+
+        // Apply split adjustment once per security — the factor depends
+        // only on the bar's date, which is `day` for every surviving row.
+        let mut out = Vec::with_capacity(by_key.len());
+        for ((symbol, sid), mut bars) in by_key {
+            let factors: &[SplitFactor] = self
+                .splits_by_sid
+                .get(&sid)
+                .or_else(|| self.splits_by_symbol.get(&symbol))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let f = Self::factor_at(factors, day);
+            if f != 1.0 {
+                for b in &mut bars {
+                    b.open *= f;
+                    b.high *= f;
+                    b.low *= f;
+                    b.close *= f;
+                    b.volume /= f;
+                }
+            }
+            out.push(DaySession {
+                security_id: SecurityId::new(&sid),
+                display_symbol: symbol,
+                session: Session::new(day, bars),
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -544,16 +675,17 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_violation_is_a_hard_error() {
-        // Construct a splits.parquet whose row's execution_date > pin.
-        // Reader::open MUST refuse to build.
-        use parquet::file::metadata::KeyValue;
+    fn future_dated_split_is_excluded_from_adjustment() {
+        // Vendor snapshots contain announced-but-not-yet-executed splits
+        // (execution_date > pin). They are not in the tape as of the pin
+        // basis, so the reader must EXCLUDE them from the factor tables —
+        // letting one in would mis-adjust every historical bar.
         let dir = tempdir().unwrap();
         let splits_path = dir.path().join("splits.parquet");
         let bars_dir = dir.path().join("bars");
         std::fs::create_dir_all(&bars_dir).unwrap();
 
-        // Pin = 2020-08-30 but row.execution_date = 2020-08-31 → violation.
+        // Pin = 2020-08-30 but row.execution_date = 2020-08-31 (future).
         let pin = NaiveDate::from_ymd_opt(2020, 8, 30).unwrap();
         let rows = vec![SplitRow {
             id: "S1".into(),
@@ -567,17 +699,15 @@ mod tests {
         let mut figi = HashMap::new();
         figi.insert("AAPL".to_string(), "BBG000B9XRY4".to_string());
         write_splits(&splits_path, &rows, pin, &figi).unwrap();
-        // Confirm the stamp went in unchanged.
-        let _ = KeyValue {
-            key: "splits_snapshot_date".into(),
-            value: Some(pin.to_string()),
-        };
 
-        let res = MaterializedBarReader::open(&bars_dir, &splits_path, FigiMap::empty());
-        assert!(matches!(
-            res,
-            Err(BarReaderError::SnapshotViolation { .. })
-        ));
+        let reader =
+            MaterializedBarReader::open(&bars_dir, &splits_path, FigiMap::empty()).unwrap();
+        // The future split must not appear in either factor table…
+        assert!(reader.splits_by_sid.get("BBG000B9XRY4").is_none());
+        assert!(reader.splits_by_symbol.get("AAPL").is_none());
+        // …so the adjustment factor for any historical date stays 1.0.
+        let before = NaiveDate::from_ymd_opt(2020, 8, 28).unwrap();
+        assert_eq!(MaterializedBarReader::factor_at(&[], before), 1.0);
     }
 
     #[test]
@@ -599,6 +729,89 @@ mod tests {
 
         let res = MaterializedBarReader::open(&bars_dir, &splits_path, FigiMap::empty());
         assert!(matches!(res, Err(BarReaderError::MissingPin)));
+    }
+
+    #[test]
+    fn day_sessions_bulk_reads_every_security_split_adjusted() {
+        // Two securities in one day file; AAPL is pre-split so its bars
+        // must come back adjusted, MSFT untouched. One scan, both back.
+        let dir = tempdir().unwrap();
+        let splits = dir.path().join("splits.parquet");
+        let pin = NaiveDate::from_ymd_opt(2026, 6, 7).unwrap();
+        write_splits_for_aapl(&splits, pin);
+
+        let bars_dir = dir.path().join("bars");
+        write_one_day_bars(
+            &bars_dir,
+            "AAPL",
+            "BBG000B9XRY4",
+            "2020-08-28",
+            &[(400.0, 405.0, 398.0, 402.0, 1000.0)],
+        );
+        // Append MSFT rows to the same day by writing a second file is not
+        // possible (one file per day) — write both in one go instead.
+        // write_one_day_bars overwrites, so build a combined file manually.
+        std::fs::remove_file(bars_dir.join("2020-08-28.parquet")).unwrap();
+        {
+            let schema = bars_1m_raw_schema();
+            let day = NaiveDate::from_ymd_opt(2020, 8, 28).unwrap();
+            let mk_t = |min: u32| {
+                Utc.with_ymd_and_hms(day.year(), day.month(), day.day(), 14, 30 + min, 0)
+                    .unwrap()
+                    .timestamp_nanos_opt()
+                    .unwrap()
+            };
+            let security_id: ArrayRef = Arc::new(StringArray::from(vec![
+                "BBG000B9XRY4",
+                "BBG000BPH459",
+            ]));
+            let display_symbol: ArrayRef =
+                Arc::new(StringArray::from(vec!["AAPL", "MSFT"]));
+            let t: ArrayRef = Arc::new(
+                TimestampNanosecondArray::from(vec![mk_t(0), mk_t(0)]).with_timezone("UTC"),
+            );
+            let open: ArrayRef = Arc::new(Float64Array::from(vec![400.0, 210.0]));
+            let high: ArrayRef = Arc::new(Float64Array::from(vec![405.0, 211.0]));
+            let low: ArrayRef = Arc::new(Float64Array::from(vec![398.0, 209.0]));
+            let close: ArrayRef = Arc::new(Float64Array::from(vec![402.0, 210.5]));
+            let volume: ArrayRef = Arc::new(Float64Array::from(vec![1000.0, 2000.0]));
+            let transactions: ArrayRef =
+                Arc::new(arrow::array::Int64Array::from(vec![Some(1i64), Some(1)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![security_id, display_symbol, t, open, high, low, close, volume, transactions],
+            )
+            .unwrap();
+            let file = File::create(bars_dir.join("2020-08-28.parquet")).unwrap();
+            let mut w =
+                ArrowWriter::try_new(file, schema, Some(WriterProperties::builder().build()))
+                    .unwrap();
+            w.write(&batch).unwrap();
+            let _ = w.close().unwrap();
+        }
+
+        let reader =
+            MaterializedBarReader::open(&bars_dir, &splits, FigiMap::empty()).unwrap();
+        let day = NaiveDate::from_ymd_opt(2020, 8, 28).unwrap();
+        let sessions = reader.day_sessions(day).unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        // BTreeMap order: AAPL first.
+        let aapl = &sessions[0];
+        assert_eq!(aapl.display_symbol, "AAPL");
+        assert_eq!(aapl.security_id.as_str(), "BBG000B9XRY4");
+        assert!((aapl.session.bars[0].open - 100.0).abs() < 1e-9, "split-adjusted");
+        assert!((aapl.session.bars[0].volume - 4000.0).abs() < 1e-9);
+
+        let msft = &sessions[1];
+        assert_eq!(msft.display_symbol, "MSFT");
+        assert!((msft.session.bars[0].open - 210.0).abs() < 1e-9, "no split: raw");
+
+        // Missing day is a typed error.
+        assert!(matches!(
+            reader.day_sessions(NaiveDate::from_ymd_opt(2020, 8, 29).unwrap()),
+            Err(BarReaderError::MissingDay(_))
+        ));
     }
 
     #[test]

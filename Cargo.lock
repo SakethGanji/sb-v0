@@ -2527,6 +2527,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "momentum-classify"
+version = "0.0.0"
+dependencies = [
+ "momentum-core",
+]
+
+[[package]]
 name = "momentum-core"
 version = "0.0.0"
 dependencies = [
@@ -2534,6 +2541,24 @@ dependencies = [
  "chrono",
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "momentum-engine"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "chrono",
+ "chrono-tz",
+ "momentum-calendar",
+ "momentum-core",
+ "momentum-store",
+ "parquet",
+ "rusqlite",
+ "tempfile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -4542,6 +4567,21 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "write-phase0"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "chrono",
+ "momentum-calendar",
+ "momentum-core",
+ "momentum-engine",
+ "momentum-store",
+ "parquet",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "writeable"

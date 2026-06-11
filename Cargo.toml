@@ -5,6 +5,8 @@ members = [
     "crates/momentum-api",
     "crates/momentum-store",
     "crates/momentum-calendar",
+    "crates/momentum-classify",
+    "crates/momentum-engine",
     "bin/hello-rest",
     "bin/hello-s3",
     "bin/smoke-universe",
@@ -24,6 +26,7 @@ members = [
     "bin/build-short-interest",
     "bin/build-financials",
     "bin/build-edgar-acceptance",
+    "bin/write-phase0",
 ]
 
 [workspace.package]
@@ -86,6 +89,8 @@ momentum-core     = { path = "crates/momentum-core" }
 momentum-api      = { path = "crates/momentum-api" }
 momentum-store    = { path = "crates/momentum-store" }
 momentum-calendar = { path = "crates/momentum-calendar" }
+momentum-classify = { path = "crates/momentum-classify" }
+momentum-engine   = { path = "crates/momentum-engine" }
 
 [profile.dev]
 opt-level = 0

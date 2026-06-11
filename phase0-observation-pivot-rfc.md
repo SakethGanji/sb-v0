@@ -1,4 +1,4 @@
-# Phase 0 — Observation-Centric Recording (RFC v6)
+# Phase 0 — Observation-Centric Recording (RFC v7)
 
 **Audience:** an LLM or human reviewer with no prior context.
 Self-contained.
@@ -8,7 +8,10 @@ and short-swing horizons (denser sub-day checkpoints, gap-vs-RTH
 decomposition, target-before-stop materializations, entry-quality
 proxies), and adds point-in-time security classification so the
 research never blindly pools mega-cap tech with low-float biotech
-gappers, leveraged ETFs, ADRs, SPACs, or warrants. Changelog at end.
+gappers, leveraged ETFs, ADRs, SPACs, or warrants. v7 (2026-06-11)
+lands the `phase1-research-strategy.md` §3.7 schema amendments:
+table v2 deltas (+66 columns across 4 tables), the terminal-event
+enum, and the metadata-stamp contract. Changelog at end.
 
 ---
 
@@ -69,16 +72,21 @@ file-level Parquet metadata. Changing any of them means
 regenerating the file with a bumped version; downstream readers
 check versions and refuse to join across mismatches.
 
-| Parameter set | Default in v6 | Metadata key |
+| Parameter set | Default in v7 | Metadata key |
 |---|---|---|
 | Entry-offset grid | 17 offsets (§9) | `entry_offset_grid_version = v1` |
 | Forward-horizon set (wide outcomes) | 13 horizons (§9) | `forward_horizons_version = v2` |
-| Forward-path checkpoint set | 23 checkpoints (§9.5) | `forward_path_checkpoints_version = v1` |
+| Forward-path checkpoint set | 23 checkpoints (§9.5); v2 = +4 path-state columns, SET unchanged | `forward_path_checkpoints_version = v2` |
 | Fixed-% threshold set | 7 thresholds ±0.5/1/2/3/5/10/20 | `pct_threshold_version = v2` |
 | ATR-multiple threshold set | 6 thresholds ±0.25/0.5/1/1.5/2/3 | `atr_threshold_version = v2` |
 | Regime taxonomy | 5 taxonomies (§10) | `regime_taxonomy_version = v1` |
 | Security-classification rule set | 1.x rules (§11.6) | `security_classification_version = v1` |
 | Label recipes | TBD per Phase 3 | `label_recipe_version = TBD` |
+| `daily_observation` schema | v2 (+14 columns, strategy doc §3.7) | `daily_observation_version = v2` |
+| `forward_outcomes` schema | v2 (+42 columns, 615 → 657, strategy doc §3.7) | `forward_outcomes_version = v2` |
+| `market_context_daily` schema | v2 (+6 columns, strategy doc §3.7) | `market_context_daily_version = v2` |
+| Default signal definition | `intraday_ret_0930_to_1000 > 0` | `signal_definition` (literal expr) + `signal_definition_version = v1` |
+| Regime bucket thresholds | per-taxonomy boundary values + computation window | `regime_thresholds_<taxonomy>`, `regime_thresholds_window` |
 
 These grids are NOT externalized at runtime because they shape the
 schema. The version stamps make parameter dependence explicit.
@@ -1281,3 +1289,59 @@ fixed-% thresholds, full externalization of grids, 2d/126d horizons.
 
 **Future-table additions:** `index_membership_daily.parquet`
 contemplated (joins reserved).
+
+### v6 → v7 (strategy-doc §3.7 amendment, 2026-06-11)
+
+The full specification, rationale, and audit trail live in
+`phase1-research-strategy.md` §3.1–§3.7; this entry records the
+schema-level delta. Coded in
+`crates/momentum-core/src/phase0_outputs.rs`.
+
+**`daily_observation` → v2 (+14):** signal freshness
+(`signal_first_in_{5d,10d,20d}`), signal concentration (trailing
+percentile + HHI), premarket-volume-vs-20d-median + spike flag,
+52w high/low (parents, not the ratio), days-since-last-{5,10,20}%-move,
+consecutive-up-days, gap-filled flag. The `signal_*` columns embed the
+default signal definition — the literal expression is stamped into file
+metadata (`signal_definition` + `signal_definition_version = v1`).
+
+**`forward_outcomes` → v2 (+42, 615 → 657):**
+- `ret_<H>_total` + `dividend_ex_date_within_<H>` for the 9 multi-day
+  horizons (dividend-adjusted total returns, §3.3 — bars are price-only
+  by the single-adjustment-baseline decision).
+- `bar_gap_minutes_max_<H>` for all 13 horizons (halt/LULD exitability
+  proxy, §3.4).
+- `first_event_<pair>` (dict: `target_first / stop_first / neither /
+  no_data`) for the 9 frozen target/stop pairs — exact at 1m
+  resolution; replaces the §3.2 path-grain `censor_type` idea (the
+  trade-ending event is a property of a (trade, pair), not a
+  checkpoint).
+- `cumulative_volume_to_entry` + `cumulative_dollar_volume_to_entry`
+  (pre-entry volume at all 17 offsets, §3.6).
+
+**`forward_path_short` → v2 (+4, 15 → 19):** `volatility_within_trade`,
+`rate_of_change`, `current_ret_over_atr_14d` (Markov-state
+augmentation, §7.3.1), `halt_gap_crossed` (§3.4). Checkpoint SET stays
+the full 23 (§3.6 decision: v1-lite rejected as an arbitrary cutoff);
+`forward_path_checkpoints_version` bumps to v2 for the schema change
+only.
+
+**`market_context_daily` → v2 (+6):** cross-sectional return
+dispersion + IQR at 10:00 and EOD (the §2.6 dispersion-regime axis),
+`universe_median_addv_20d` + `universe_total_dollar_volume` (continuous
+parents of the liquidity regime taxonomy).
+
+**`regime_definitions` (stays v1):** writers must stamp per-taxonomy
+bucket boundary values + the window they were computed on
+(`regime_thresholds_<taxonomy>`, `regime_thresholds_window`).
+
+**`terminal_event_type` enum frozen (v1):** `none /
+delisted_merger_acquisition / delisted_bankruptcy_liquidation /
+delisted_exchange_compliance / delisted_unknown /
+extended_halt_no_bars`; ambiguity carried by
+`terminal_event_confidence`, never by extra enum values.
+
+**Versioning:** `daily_observation_version = v2`,
+`forward_outcomes_version = v2`, `forward_path_checkpoints_version =
+v2`, `market_context_daily_version = v2`; all stamps round-trip-tested
+in `phase0_output_schemas_roundtrip.rs`.

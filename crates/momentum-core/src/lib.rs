@@ -2,6 +2,7 @@ pub mod bar;
 pub mod enums;
 pub mod error;
 pub mod ids;
+pub mod phase0_outputs;
 pub mod schema;
 pub mod store;
 

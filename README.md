@@ -1,11 +1,37 @@
 # Momentum Hold — Phase 0 Build Plan
 
-This repo implements the experiment specified in
-[`momentum-hold-phase0-frozen-v2.md`](./momentum-hold-phase0-frozen-v2.md).
+> ## ⚠️ Output schema is now defined by the RFC, not by this README
+>
+> [`phase0-observation-pivot-rfc.md`](./phase0-observation-pivot-rfc.md) (v6)
+> **supersedes** the engine-output and milestone sections below. The frozen
+> spec ([`momentum-hold-phase0-frozen-v2.md`](./momentum-hold-phase0-frozen-v2.md))
+> still defines the *experiment* (signal, entry, breakeven exit, path horizon),
+> but Phase 0 now writes **eight observation-centric Parquet tables** instead
+> of `per_trade_summary` + `per_trade_bar_path`. The trade-centric outputs are
+> a **derived** artifact (~30-line script) per RFC §16.
+>
+> Specifically, the following sections in this README are stale and should
+> be read with RFC v6 as the authoritative source:
+> - **§1 "What we're actually building"** — outputs are the 8 RFC tables.
+> - **§6.5 "Path recording"** — replaced by `forward_outcomes.parquet` +
+>   `forward_path_short.parquet` (RFC §9, §9.5).
+> - **§7 Milestones M5–M9** — engine work re-scoped against the RFC's
+>   five-stage implementation order (RFC §17).
+> - **§10 "Downstream contract"** — Phase 1 statistical work has its own
+>   conditioning rules (RFC §14.4) that the schema must serve.
+>
+> The **ingest layer (§2, §5, §11)**, **identifier discipline (§4)**,
+> **storage shape (§5.4)**, and **calendar/half-day handling (§6.1, §6.8)**
+> in this README are still current and binding.
 
-Phase 0 is **not** a trading verdict — it builds a reusable trade-path dataset
-so we can later evaluate giveback/trailing/profit-target rules without
-re-running the simulation.
+This repo implements the experiment specified in
+[`momentum-hold-phase0-frozen-v2.md`](./momentum-hold-phase0-frozen-v2.md),
+with outputs reshaped per
+[`phase0-observation-pivot-rfc.md`](./phase0-observation-pivot-rfc.md).
+
+Phase 0 is **not** a trading verdict — it builds a reusable observational
+dataset (8 Parquet tables) so we can later characterize the conditional
+return distribution per regime without re-running the simulation.
 
 Stack: **Rust (2024 edition)**, Massive (Polygon) REST API + S3 flat files, Parquet/DuckDB for storage.
 

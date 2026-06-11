@@ -1,11 +1,11 @@
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use std::sync::{Arc, OnceLock};
 
-fn utc_ns() -> DataType {
+pub(crate) fn utc_ns() -> DataType {
     DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
 }
 
-fn dict_str() -> DataType {
+pub(crate) fn dict_str() -> DataType {
     DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
 }
 
@@ -154,6 +154,20 @@ pub const VIX_SNAPSHOT_DATE_META: &str = "vix_snapshot_date";
 /// leveraged/inverse ETFs heuristically). One row per (security_id,
 /// snapshot_date); the snapshot date lives in file-level Parquet
 /// metadata under `ticker_details_snapshot_date`.
+///
+/// **Naming note vs. the RFC.** The observation-pivot RFC (v6) §6.6 / §11.6
+/// references "`tickers_enriched.parquet`" as the source of point-in-time
+/// classification inputs (`is_etf`, `is_adr`, `sic`-derived sector, etc.).
+/// In this repo that role is split across two files:
+///
+/// - `tickers_enriched.parquet` — minimal universe enrichment (FIGI fill-in
+///   + `delisted_utc`). Used as the join key surface (`figi_map` source).
+/// - `tickers_classified.parquet` — the richer classification snapshot
+///   (this schema). This is the file that feeds the §11.6 behavioral-tag
+///   inputs and the `momentum-classify` crate.
+///
+/// Downstream readers that want "RFC's tickers_enriched" should read this
+/// file; the slimmer `tickers_enriched.parquet` is only for the join layer.
 ///
 /// Most fields are nullable because the Massive details endpoint
 /// returns sparse data for thinly-covered or long-delisted tickers.
