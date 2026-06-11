@@ -6,35 +6,48 @@
 //!   [--out data/outputs] [--cursor data/_engine_state.sqlite] [--force]
 //! ```
 //!
-//! Days run in calendar order because trailing state (ATR, ADV, 52w
-//! range, first-bar map) accumulates during the sweep — the RFC §6.2
-//! `[D-N, D-1]` contract is enforced by reading features BEFORE pushing
-//! the day into [`momentum_engine::rolling::RollingState`].
+//! Writes per day: `daily_observation/` (stamped `B1-partial` — earnings
+//! proximity lands with B2's calendar join) and `market_context_daily/`
+//! (stamped `B1`). Days run in calendar order because trailing state
+//! (rolling windows, index cum-log returns for betas, the signal-share
+//! history) accumulates during the sweep — the RFC §6.2 `[D-N, D-1]`
+//! contract is enforced by reading features BEFORE pushing the day.
 //!
-//! Resume semantics: a day already marked done in the cursor is still
-//! READ (its aggregates feed later days' trailing windows) but not
-//! rebuilt or rewritten. `--from` later than the dataset start trades
+//! Resume semantics: a day already marked done is still READ (its
+//! aggregates feed later days' trailing state) but not rebuilt or
+//! rewritten. `--from` later than the dataset start trades
 //! trailing-window completeness for speed — fine for smoke runs, never
-//! for the real run (trailing columns near `--from` are null/short
-//! exactly like the true dataset start).
+//! for the real run.
 
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use momentum_calendar::Calendar;
-use momentum_core::phase0_outputs::daily_observation_schema;
+use momentum_core::phase0_outputs::{daily_observation_schema, market_context_daily_schema};
 use momentum_engine::cursor::EngineCursor;
-use momentum_engine::daily_observation::{self, RowInput};
+use momentum_engine::daily_observation::{self, DayContext, RowInput};
+use momentum_engine::market_context::{self, IndexDay, UniverseSnapshot};
 use momentum_engine::rolling::RollingState;
+use momentum_engine::slices::{et, slice};
 use momentum_engine::{aggregates, stamps};
-use momentum_store::bar_reader::MaterializedBarReader;
+use momentum_store::bar_reader::{DaySession, MaterializedBarReader};
+use momentum_store::dividends::read_ex_dividend_dates;
 use momentum_store::figi_map::FigiMap;
+use momentum_store::vix::read_vix_closes;
 use parquet::arrow::ArrowWriter;
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
 use std::time::Instant;
 
-const TABLE: &str = "daily_observation";
-const MILESTONE: &str = "B1-partial";
+const OBS_TABLE: &str = "daily_observation";
+const OBS_MILESTONE: &str = "B1-partial"; // earnings proximity lands in B2
+const CTX_TABLE: &str = "market_context_daily";
+const CTX_MILESTONE: &str = "B1";
+/// "Split nearby" = execution date within ±3 calendar days of D
+/// (documented definition; the RFC leaves the window unspecified).
+const SPLIT_NEARBY_CAL_DAYS: i64 = 3;
+
+const INDEX_SYMBOLS: [&str; 3] = ["SPY", "QQQ", "IWM"];
 
 struct Args {
     from: Option<NaiveDate>,
@@ -78,6 +91,24 @@ fn parse_args() -> Result<Args> {
     Ok(args)
 }
 
+fn write_table(
+    dir: &PathBuf,
+    day: NaiveDate,
+    schema: arrow::datatypes::SchemaRef,
+    batch: &arrow::array::RecordBatch,
+    stamps_list: &[(String, String)],
+    milestone: &str,
+) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{day}.parquet"));
+    let props = stamps::writer_props(stamps_list, milestone);
+    let file = File::create(&path)?;
+    let mut w = ArrowWriter::try_new(file, schema, Some(props))?;
+    w.write(batch)?;
+    w.close()?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -90,6 +121,8 @@ fn main() -> Result<()> {
     let t0 = Instant::now();
     let figi = FigiMap::open(&args.reference.join("figi_map.parquet"))
         .context("open figi_map.parquet")?;
+    // Second instance for rename probes — the first moves into the reader.
+    let figi_probe = FigiMap::open(&args.reference.join("figi_map.parquet"))?;
     let reader = MaterializedBarReader::open(
         &args.bars,
         &args.reference.join("splits.parquet"),
@@ -98,6 +131,20 @@ fn main() -> Result<()> {
     .context("open bar reader")?;
     let calendar = Calendar::open(&args.bars).context("open calendar")?;
     let cursor = EngineCursor::open(&args.cursor)?;
+    let dividends = match read_ex_dividend_dates(&args.reference.join("dividends.parquet")) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(%e, "dividends.parquet unavailable — dividend_event_today will be null");
+            None
+        }
+    };
+    let vix = match read_vix_closes(&args.reference.join("vix_daily.parquet")) {
+        Ok(m) => Some(m),
+        Err(e) => {
+            tracing::warn!(%e, "vix_daily.parquet unavailable — vix_close will be null");
+            None
+        }
+    };
 
     let days: Vec<NaiveDate> = calendar
         .trading_days()
@@ -122,9 +169,13 @@ fn main() -> Result<()> {
         t0.elapsed()
     );
 
-    let dir = args.out.join(TABLE);
-    std::fs::create_dir_all(&dir)?;
+    let obs_dir = args.out.join(OBS_TABLE);
+    let ctx_dir = args.out.join(CTX_TABLE);
     let mut rolling = RollingState::new();
+    // Index cum-log close returns, one map per [SPY, QQQ, IWM].
+    let mut index_cumlog: [HashMap<NaiveDate, f64>; 3] = Default::default();
+    let mut index_cum: [f64; 3] = [0.0; 3];
+    let mut signal_share_history: Vec<f64> = Vec::with_capacity(days.len());
     let mut written = 0usize;
     let mut skipped = 0usize;
     let sweep_t = Instant::now();
@@ -132,41 +183,170 @@ fn main() -> Result<()> {
     for (i, day) in days.iter().copied().enumerate() {
         let sessions = reader.day_sessions(day)?;
         let session_close = calendar.session_close(day)?;
+        let factors: Vec<f64> = sessions
+            .iter()
+            .map(|s| reader.adjustment_factor(&s.security_id, &s.display_symbol, day))
+            .collect();
         let aggs: Vec<_> = sessions
             .iter()
-            .map(|s| aggregates::compute(&s.session, day, session_close))
+            .zip(&factors)
+            .map(|(s, f)| aggregates::compute(&s.session, day, session_close, *f))
             .collect();
 
-        let done = cursor.is_done(TABLE, day)? && !args.force;
-        if done {
-            skipped += 1;
-        } else {
+        let obs_done = cursor.is_done(OBS_TABLE, day)? && !args.force;
+        let ctx_done = cursor.is_done(CTX_TABLE, day)? && !args.force;
+
+        if !obs_done {
             let rows: Vec<RowInput<'_>> = sessions
                 .iter()
                 .zip(&aggs)
-                .map(|(s, agg)| RowInput {
+                .zip(&factors)
+                .map(|((s, agg), f)| RowInput {
                     session: s,
                     agg: *agg,
-                    adjustment_factor: reader.adjustment_factor(
+                    adjustment_factor: *f,
+                    dividend_event_today: dividends.as_ref().map(|set| {
+                        set.contains(&(s.security_id.as_str().to_string(), day))
+                            || set.contains(&(s.display_symbol.clone(), day))
+                    }),
+                    ticker_event_today: Some(figi_probe.renamed_on(&s.security_id, day)),
+                    split_event_nearby: Some(reader.split_event_within(
                         &s.security_id,
                         &s.display_symbol,
                         day,
-                    ),
+                        SPLIT_NEARBY_CAL_DAYS,
+                    )),
                 })
                 .collect();
-            let batch = daily_observation::build(day, &rows, session_close, &rolling)?;
-
-            let path = dir.join(format!("{day}.parquet"));
-            let props = stamps::writer_props(&stamps::daily_observation_stamps(), MILESTONE);
-            let file = File::create(&path)?;
-            let mut w = ArrowWriter::try_new(file, daily_observation_schema(), Some(props))?;
-            w.write(&batch)?;
-            w.close()?;
-            cursor.mark_done(TABLE, day)?;
+            let day_ctx = DayContext {
+                index_cumlog: [&index_cumlog[0], &index_cumlog[1], &index_cumlog[2]],
+                signal_share_history: &signal_share_history,
+            };
+            let batch = daily_observation::build(day, &rows, session_close, &rolling, &day_ctx)?;
+            write_table(
+                &obs_dir,
+                day,
+                daily_observation_schema(),
+                &batch,
+                &stamps::daily_observation_stamps(),
+                OBS_MILESTONE,
+            )?;
+            cursor.mark_done(OBS_TABLE, day)?;
             written += 1;
+        } else {
+            skipped += 1;
         }
 
-        // Push AFTER building: trailing reads stay [D-N, D-1].
+        if !ctx_done {
+            let universe: Vec<UniverseSnapshot> = sessions
+                .iter()
+                .zip(&aggs)
+                .map(|(s, agg)| {
+                    let hist = rolling.get(s.security_id.as_str());
+                    let bars = &s.session.bars;
+                    let rth_open_t = et(day, 9, 30);
+                    let ret_1030 = slice(bars, rth_open_t, et(day, 10, 30))
+                        .last()
+                        .and_then(|l| {
+                            agg.map(|a| a.rth_open)
+                                .filter(|o| *o > 0.0)
+                                .map(|o| l.close / o - 1.0)
+                        });
+                    let ret_1000 = agg.and_then(|a| a.snapshot_ret_1000);
+                    let px_1000 = agg
+                        .map(|a| a.rth_open)
+                        .zip(ret_1000)
+                        .map(|(o, r)| o * (1.0 + r));
+                    UniverseSnapshot {
+                        ret_0930_to_1000: ret_1000,
+                        ret_0930_to_1030: ret_1030,
+                        eod_intraday_return: agg
+                            .filter(|a| a.rth_open > 0.0)
+                            .map(|a| a.rth_close / a.rth_open - 1.0),
+                        above_premarket_vwap_at_1000: px_1000
+                            .zip(agg.and_then(|a| a.premarket_vwap))
+                            .map(|(p, v)| p > v),
+                        move_vs_atr14_at_1000: px_1000
+                            .zip(agg.map(|a| a.rth_open))
+                            .zip(hist.and_then(|h| h.atr(14)).filter(|a| *a > 0.0))
+                            .map(|((p, o), atr)| (p - o).abs() / atr),
+                        rth_dollar_volume: agg.map(|a| a.rth_dollar_volume),
+                        addv_20d: hist.and_then(|h| h.addv(20)),
+                    }
+                })
+                .collect();
+
+            let index_day = |sym: &str| -> Option<IndexDay<'_>> {
+                let pos = sessions.iter().position(|s| s.display_symbol == sym)?;
+                let s: &DaySession = &sessions[pos];
+                let agg = aggs[pos]?;
+                let hist = rolling.get(s.security_id.as_str());
+                let prior_close = hist.and_then(|h| h.prior()).map(|p| p.rth_close);
+                Some(IndexDay {
+                    bars: &s.session.bars,
+                    eod_open: Some(agg.rth_open),
+                    eod_high: Some(agg.rth_high),
+                    eod_low: Some(agg.rth_low),
+                    eod_close: Some(agg.rth_close),
+                    eod_volume: Some(agg.rth_volume),
+                    overnight_gap: prior_close
+                        .filter(|pc| *pc > 0.0)
+                        .map(|pc| agg.rth_open / pc - 1.0),
+                    ret_0930_to_1000: agg.snapshot_ret_1000,
+                    realized_vol_21d: hist.and_then(|h| h.realized_vol(21)),
+                })
+            };
+            let indices = [
+                index_day(INDEX_SYMBOLS[0]),
+                index_day(INDEX_SYMBOLS[1]),
+                index_day(INDEX_SYMBOLS[2]),
+            ];
+            let batch = market_context::build(
+                day,
+                session_close,
+                indices,
+                &universe,
+                vix.as_ref().and_then(|m| m.get(&day)).copied(),
+            )?;
+            write_table(
+                &ctx_dir,
+                day,
+                market_context_daily_schema(),
+                &batch,
+                &stamps::market_context_daily_stamps(),
+                CTX_MILESTONE,
+            )?;
+            cursor.mark_done(CTX_TABLE, day)?;
+        }
+
+        // ---- Push AFTER building: trailing reads stay [D-N, D-1]. ----
+        // Index cum-log returns (uses rolling's prior close, pre-update).
+        for (k, sym) in INDEX_SYMBOLS.iter().enumerate() {
+            if let Some(pos) = sessions.iter().position(|s| s.display_symbol == *sym) {
+                if let Some(agg) = &aggs[pos] {
+                    if let Some(pc) = rolling
+                        .get(sessions[pos].security_id.as_str())
+                        .and_then(|h| h.prior())
+                        .map(|p| p.rth_close)
+                        .filter(|pc| *pc > 0.0)
+                    {
+                        index_cum[k] += (agg.rth_close / pc).ln();
+                    }
+                    index_cumlog[k].insert(day, index_cum[k]);
+                }
+            }
+        }
+        // Universe signal share (same definition as the builder's).
+        let valid = aggs.iter().flatten().filter(|a| a.snapshot_ret_1000.is_some()).count();
+        let fired = aggs
+            .iter()
+            .flatten()
+            .filter(|a| a.snapshot_ret_1000.is_some_and(|r| r > 0.0))
+            .count();
+        if valid > 0 {
+            signal_share_history.push(fired as f64 / valid as f64);
+        }
+        // Per-security rolling state.
         for (s, agg) in sessions.iter().zip(&aggs) {
             if let Some(agg) = agg {
                 rolling.update(s.security_id.as_str(), day, *agg);
@@ -189,7 +369,7 @@ fn main() -> Result<()> {
     }
 
     println!(
-        "done: {written} written, {skipped} skipped, {} securities tracked, total {:.1} min",
+        "done: {written} obs written, {skipped} skipped, {} securities tracked, total {:.1} min",
         rolling.len(),
         sweep_t.elapsed().as_secs_f64() / 60.0
     );

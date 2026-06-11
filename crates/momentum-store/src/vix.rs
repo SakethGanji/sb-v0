@@ -81,6 +81,41 @@ pub fn read_snapshot_date(path: &Path) -> Result<Option<NaiveDate>, WriteError> 
     Ok(None)
 }
 
+/// Read `vix_daily.parquet` into a `date → vix_close` map. Rows with a
+/// null `vix_close` are skipped (the schema declares the column
+/// non-nullable, so this is defensive only).
+pub fn read_vix_closes(
+    path: &Path,
+) -> Result<std::collections::HashMap<NaiveDate, f64>, WriteError> {
+    use arrow::array::{Array, AsArray};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = File::open(path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
+    let mut out: std::collections::HashMap<NaiveDate, f64> =
+        std::collections::HashMap::new();
+    for batch_res in reader {
+        let batch = batch_res?;
+        let dates = batch
+            .column_by_name("date")
+            .expect("date")
+            .as_primitive::<arrow::datatypes::Date32Type>();
+        let closes = batch
+            .column_by_name("vix_close")
+            .expect("vix_close")
+            .as_primitive::<arrow::datatypes::Float64Type>();
+        for i in 0..batch.num_rows() {
+            if closes.is_null(i) {
+                continue;
+            }
+            let date = epoch + chrono::Duration::days(dates.value(i) as i64);
+            out.insert(date, closes.value(i));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +159,32 @@ mod tests {
             .unwrap()
             .as_primitive::<arrow::datatypes::Float64Type>();
         assert!((vc.value(2) - 82.69).abs() < 1e-9);
+    }
+
+    #[test]
+    fn read_vix_closes_maps_dates_to_closes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vix.parquet");
+        let rows = vec![
+            VixRow {
+                date: NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+                vix_close: 13.20,
+            },
+            VixRow {
+                date: NaiveDate::from_ymd_opt(2020, 3, 16).unwrap(),
+                vix_close: 82.69,
+            },
+        ];
+        let snap = NaiveDate::from_ymd_opt(2026, 6, 7).unwrap();
+        write_vix(&path, &rows, snap).unwrap();
+
+        let m = read_vix_closes(&path).unwrap();
+        assert_eq!(m.len(), 2);
+        let d1 = NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2020, 3, 16).unwrap();
+        assert!((m[&d1] - 13.20).abs() < 1e-9);
+        assert!((m[&d2] - 82.69).abs() < 1e-9);
+        // Absent day → no entry.
+        assert!(!m.contains_key(&NaiveDate::from_ymd_opt(2024, 1, 3).unwrap()));
     }
 }

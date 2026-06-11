@@ -27,9 +27,16 @@ pub struct DailyAgg {
     pub rth_high: f64,
     pub rth_low: f64,
     pub rth_close: f64,
+    /// Raw tape price (`rth_close / adjustment_factor`), for the
+    /// `prior_day_unadjusted_eod_close` column.
+    pub rth_close_unadjusted: f64,
     pub rth_volume: f64,
     pub rth_dollar_volume: f64,
     pub rth_vwap: f64,
+    /// The default signal snapshot (`intraday_ret_0930_to_1000`),
+    /// carried in history so signal-freshness columns can ask "did the
+    /// signal fire on day D-k". None when no bars printed before 10:00.
+    pub snapshot_ret_1000: Option<f64>,
     // Pre-market (04:00–09:30 ET); None when no premarket prints.
     pub premarket_volume: f64,
     pub premarket_dollar_volume: f64,
@@ -43,7 +50,14 @@ pub struct DailyAgg {
 
 /// Compute the day's aggregates. Returns `None` when the session has no
 /// RTH bars (premarket-only prints happen on halted/expiring names).
-pub fn compute(session: &Session, day: NaiveDate, session_close: DateTime<Utc>) -> Option<DailyAgg> {
+/// `adjustment_factor` is the pin-basis factor already applied to the
+/// session's prices (1.0 = no splits after this day).
+pub fn compute(
+    session: &Session,
+    day: NaiveDate,
+    session_close: DateTime<Utc>,
+    adjustment_factor: f64,
+) -> Option<DailyAgg> {
     let bars = &session.bars;
     let premarket_start = et(day, 4, 0);
     let rth_open_t = et(day, 9, 30);
@@ -52,6 +66,11 @@ pub fn compute(session: &Session, day: NaiveDate, session_close: DateTime<Utc>) 
     let rth = slice(bars, rth_open_t, rth_end);
     let first = rth.first()?;
     let last = rth.last().expect("non-empty");
+
+    let snapshot_ret_1000 = slice(bars, rth_open_t, et(day, 10, 0))
+        .last()
+        .filter(|_| first.open > 0.0)
+        .map(|b| b.close / first.open - 1.0);
 
     let mut high = f64::MIN;
     let mut low = f64::MAX;
@@ -96,9 +115,15 @@ pub fn compute(session: &Session, day: NaiveDate, session_close: DateTime<Utc>) 
         rth_high: high,
         rth_low: low,
         rth_close: last.close,
+        rth_close_unadjusted: if adjustment_factor != 0.0 {
+            last.close / adjustment_factor
+        } else {
+            last.close
+        },
         rth_volume: vol,
         rth_dollar_volume: dvol,
         rth_vwap: if vol > 0.0 { dvol / vol } else { last.close },
+        snapshot_ret_1000,
         premarket_volume: pm_vol,
         premarket_dollar_volume: pm_dvol,
         premarket_high: (!pm.is_empty()).then_some(pm_high),
@@ -130,7 +155,7 @@ mod tests {
             bar(et(day, 15, 59), 101.2, 101.4, 101.0, 101.3, 300.0), // last 30m
         ];
         let s = Session::new(day, bars);
-        let a = compute(&s, day, close_t).unwrap();
+        let a = compute(&s, day, close_t, 1.0).unwrap();
 
         assert_eq!(a.rth_open, 100.0);
         assert_eq!(a.rth_high, 102.0);
@@ -149,6 +174,6 @@ mod tests {
     fn premarket_only_session_yields_none() {
         let day = NaiveDate::from_ymd_opt(2021, 3, 15).unwrap();
         let s = Session::new(day, vec![bar(et(day, 7, 0), 1.0, 1.0, 1.0, 1.0, 10.0)]);
-        assert!(compute(&s, day, et(day, 15, 59)).is_none());
+        assert!(compute(&s, day, et(day, 15, 59), 1.0).is_none());
     }
 }

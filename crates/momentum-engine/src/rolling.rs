@@ -133,6 +133,94 @@ impl SecurityHistory {
         self.days.iter().map(|d| d.rth_low).fold(None, |m, v| Some(m.map_or(v, |x: f64| x.min(v))))
     }
 
+    /// Yang-Zhang volatility over the last `n` days, annualized (√252).
+    /// σ²_YZ = σ²_overnight + k·σ²_open-close + (1−k)·σ²_RS,
+    /// k = 0.34 / (1.34 + (n+1)/(n−1)) (Yang & Zhang 2000).
+    pub fn yang_zhang_vol(&self, n: usize) -> Option<f64> {
+        if self.days.len() < n + 1 || n < 2 {
+            return None;
+        }
+        let s = self.days.len() - n;
+        let mut o_rets = Vec::with_capacity(n);
+        let mut c_rets = Vec::with_capacity(n);
+        let mut rs_sum = 0.0;
+        for i in s..self.days.len() {
+            let d = &self.days[i];
+            let prev_close = self.days[i - 1].rth_close;
+            if prev_close <= 0.0 || d.rth_open <= 0.0 || d.rth_low <= 0.0 {
+                return None; // degenerate prices; refuse rather than emit junk
+            }
+            o_rets.push((d.rth_open / prev_close).ln());
+            let c = (d.rth_close / d.rth_open).ln();
+            c_rets.push(c);
+            let u = (d.rth_high / d.rth_open).ln();
+            let l = (d.rth_low / d.rth_open).ln();
+            rs_sum += u * (u - c) + l * (l - c);
+        }
+        let sample_var = |v: &[f64]| {
+            let m = v.iter().sum::<f64>() / v.len() as f64;
+            v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (v.len() as f64 - 1.0)
+        };
+        let k = 0.34 / (1.34 + (n as f64 + 1.0) / (n as f64 - 1.0));
+        let yz = sample_var(&o_rets) + k * sample_var(&c_rets) + (1.0 - k) * rs_sum / n as f64;
+        (yz >= 0.0).then(|| (yz * 252.0).sqrt())
+    }
+
+    /// Beta vs an index over the last `n` daily log returns. Stock and
+    /// index returns are aligned by date through the index's
+    /// cumulative-log-return map, so a stock with missing days matches a
+    /// compounded index return over the same span. Requires ≥75% of the
+    /// window matched.
+    pub fn beta(&self, index_cumlog: &HashMap<NaiveDate, f64>, n: usize) -> Option<f64> {
+        if self.days.len() < n + 1 {
+            return None;
+        }
+        let s = self.days.len() - n;
+        let mut xs = Vec::with_capacity(n);
+        let mut ys = Vec::with_capacity(n);
+        for i in s..self.days.len() {
+            let prev = &self.days[i - 1];
+            let cur = &self.days[i];
+            if let (Some(a), Some(b)) =
+                (index_cumlog.get(&prev.day), index_cumlog.get(&cur.day))
+            {
+                if prev.rth_close > 0.0 && cur.rth_close > 0.0 {
+                    xs.push(b - a);
+                    ys.push((cur.rth_close / prev.rth_close).ln());
+                }
+            }
+        }
+        if xs.len() < n * 3 / 4 {
+            return None;
+        }
+        let m = xs.len() as f64;
+        let mx = xs.iter().sum::<f64>() / m;
+        let my = ys.iter().sum::<f64>() / m;
+        let mut cov = 0.0;
+        let mut var = 0.0;
+        for (x, y) in xs.iter().zip(&ys) {
+            cov += (x - mx) * (y - my);
+            var += (x - mx).powi(2);
+        }
+        (var > 0.0).then(|| cov / var)
+    }
+
+    /// Did the default signal (`snapshot_ret_1000 > 0`) fire on any of
+    /// the last `n` recorded days? None if fewer than `n` days on record
+    /// (can't verify "none of the prior n").
+    pub fn signal_fired_in_last(&self, n: usize) -> Option<bool> {
+        if self.days.len() < n {
+            return None;
+        }
+        Some(
+            self.days
+                .iter()
+                .rev()
+                .take(n)
+                .any(|d| d.snapshot_ret_1000.is_some_and(|r| r > 0.0)),
+        )
+    }
+
     /// Median premarket volume over the last `n` days.
     pub fn premarket_volume_median(&self, n: usize) -> Option<f64> {
         if self.days.len() < n {
@@ -207,9 +295,11 @@ mod tests {
             rth_high: h,
             rth_low: l,
             rth_close: c,
+            rth_close_unadjusted: c,
             rth_volume: v,
             rth_dollar_volume: c * v,
             rth_vwap: c,
+            snapshot_ret_1000: None,
             premarket_volume: 0.0,
             premarket_dollar_volume: 0.0,
             premarket_high: None,
@@ -274,6 +364,55 @@ mod tests {
         assert!(h.realized_vol(21).is_none());
         assert!(h.atr(42).is_none());
         assert!(h.realized_vol(5).is_some());
+    }
+
+    #[test]
+    fn beta_of_perfectly_correlated_2x_stock_is_2() {
+        let mut st = RollingState::new();
+        let mut index_cumlog: HashMap<NaiveDate, f64> = HashMap::new();
+        let mut idx_close = 100.0f64;
+        let mut stock_close = 50.0f64;
+        let mut cum = 0.0;
+        index_cumlog.insert(d(0), 0.0);
+        st.update("X", d(0), agg(d(0), stock_close, stock_close, stock_close, stock_close, 1.0));
+        for i in 1..70u32 {
+            // Index alternates ±1%; stock moves exactly 2× in log space.
+            let r: f64 = if i % 2 == 0 { 0.01 } else { -0.01 };
+            idx_close *= r.exp();
+            stock_close *= (2.0 * r).exp();
+            cum += r;
+            index_cumlog.insert(d(i), cum);
+            st.update("X", d(i), agg(d(i), stock_close, stock_close, stock_close, stock_close, 1.0));
+        }
+        let h = st.get("X").unwrap();
+        let _ = idx_close;
+        assert!((h.beta(&index_cumlog, 60).unwrap() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn yang_zhang_is_positive_and_scales_with_range() {
+        let mut st = RollingState::new();
+        for i in 0..30u32 {
+            let c = 100.0 + (i % 5) as f64;
+            // Wide intraday range relative to close-to-close moves.
+            st.update("W", d(i), agg(d(i), c, c + 5.0, c - 5.0, c, 1.0));
+            st.update("N", d(i), agg(d(i), c, c + 0.5, c - 0.5, c, 1.0));
+        }
+        let wide = st.get("W").unwrap().yang_zhang_vol(21).unwrap();
+        let narrow = st.get("N").unwrap().yang_zhang_vol(21).unwrap();
+        assert!(wide > narrow, "wider ranges must imply higher YZ vol");
+        assert!(narrow > 0.0);
+    }
+
+    #[test]
+    fn signal_fired_in_last_handles_short_history() {
+        let mut st = RollingState::new();
+        let mut a = agg(d(0), 1.0, 1.0, 1.0, 1.0, 1.0);
+        a.snapshot_ret_1000 = Some(0.02); // fired
+        st.update("X", d(0), a);
+        let h = st.get("X").unwrap();
+        assert_eq!(h.signal_fired_in_last(1), Some(true));
+        assert_eq!(h.signal_fired_in_last(5), None, "only 1 day on record");
     }
 
     #[test]

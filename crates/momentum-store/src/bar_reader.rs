@@ -252,6 +252,33 @@ impl MaterializedBarReader {
         Self::factor_at(factors, day)
     }
 
+    /// True when any split for this security executed within
+    /// `calendar_days` of `day` — i.e. `|execution_date − day| ≤
+    /// calendar_days`. Lookup prefers `splits_by_sid`, falling back to
+    /// `splits_by_symbol` (same pattern as [`Self::adjustment_factor`]).
+    ///
+    /// Note: the factor tables already exclude future-dated (post-pin)
+    /// splits at construction time, so an announced-but-not-executed
+    /// split never triggers this probe. That is intentional — it is not
+    /// in the tape as of the pin basis.
+    pub fn split_event_within(
+        &self,
+        sid: &SecurityId,
+        symbol: &str,
+        day: NaiveDate,
+        calendar_days: i64,
+    ) -> bool {
+        let factors: &[SplitFactor] = self
+            .splits_by_sid
+            .get(sid.as_str())
+            .or_else(|| self.splits_by_symbol.get(symbol))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        factors
+            .iter()
+            .any(|s| (s.execution_date - day).num_days().abs() <= calendar_days)
+    }
+
     /// Bulk read: every security's session for `day` in ONE scan of the
     /// per-day file, split-adjusted. This is the engine's read path —
     /// `session_bars` re-scans the whole file per sid, which is fine for
@@ -614,6 +641,33 @@ mod tests {
         assert!((MaterializedBarReader::factor_at(factors, before) - 0.25).abs() < 1e-12);
         // Post-split: f = 1.0.
         assert!((MaterializedBarReader::factor_at(factors, after) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn split_event_within_respects_window_and_symbol_fallback() {
+        // AAPL 4-for-1 executed 2020-08-31.
+        let dir = tempdir().unwrap();
+        let splits = dir.path().join("splits.parquet");
+        let pin = NaiveDate::from_ymd_opt(2026, 6, 7).unwrap();
+        write_splits_for_aapl(&splits, pin);
+
+        let reader =
+            MaterializedBarReader::open(dir.path(), &splits, FigiMap::empty()).unwrap();
+        let sid = SecurityId::new("BBG000B9XRY4");
+        let d = |y, m, dd| NaiveDate::from_ymd_opt(y, m, dd).unwrap();
+
+        // Exact day, zero window.
+        assert!(reader.split_event_within(&sid, "AAPL", d(2020, 8, 31), 0));
+        // 3 calendar days before: |diff| = 3 → inside a 3-day window…
+        assert!(reader.split_event_within(&sid, "AAPL", d(2020, 8, 28), 3));
+        // …but outside a 2-day window.
+        assert!(!reader.split_event_within(&sid, "AAPL", d(2020, 8, 28), 2));
+        // Window is symmetric: 2 days after also hits.
+        assert!(reader.split_event_within(&sid, "AAPL", d(2020, 9, 2), 2));
+        // Unknown sid falls back to the symbol table.
+        assert!(reader.split_event_within(&SecurityId::new("NOPE"), "AAPL", d(2020, 8, 31), 0));
+        // Neither key known → false.
+        assert!(!reader.split_event_within(&SecurityId::new("NOPE"), "MSFT", d(2020, 8, 31), 30));
     }
 
     #[test]

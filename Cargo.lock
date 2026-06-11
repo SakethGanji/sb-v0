@@ -4580,6 +4580,7 @@ dependencies = [
  "momentum-engine",
  "momentum-store",
  "parquet",
+ "tracing",
  "tracing-subscriber",
 ]
 

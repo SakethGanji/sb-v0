@@ -14,12 +14,16 @@
 //!   gap-filled flag;
 //! - bar-count data-quality + calendar fields.
 //!
-//! Still null after B1 (filled by later milestones, files stamped
-//! `B1-partial`): Yang-Zhang vols, betas (need index return state),
-//! cross-sectional ranks, first-30m/first-hour shape descriptors,
-//! signal freshness/concentration, earnings proximity (B2 join),
-//! remaining data-quality flags (missing/zero-volume bars, bad OHLC,
-//! split/dividend/ticker-event-nearby), `prior_day_unadjusted_eod_close`.
+//! Plus (B1 increment 2): Yang-Zhang vols, index betas (date-aligned
+//! via [`DayContext::index_cumlog`]), cross-sectional ranks +
+//! percentiles, first-30m/first-hour shape descriptors, signal
+//! freshness + concentration (trailing share percentile + HHI), the
+//! remaining data-quality flags, and `prior_day_unadjusted_eod_close`.
+//!
+//! Still null after B1 (B2 fills via the earnings-calendar join, files
+//! stamped `B1-partial`): `days_to_next_known_earnings`,
+//! `days_since_last_earnings`, `is_earnings_day`,
+//! `earnings_report_timing`.
 //!
 //! Leakage contract (RFC §6.2): every trailing value is read from
 //! `RollingState` BEFORE the sweep pushes today's aggregates — bare-name
@@ -51,6 +55,23 @@ pub struct RowInput<'a> {
     pub agg: Option<DailyAgg>,
     /// Pin-basis adjustment factor for this (sid, day).
     pub adjustment_factor: f64,
+    /// Reference-data event flags, resolved by the sweep (None = the
+    /// reference source wasn't loaded).
+    pub dividend_event_today: Option<bool>,
+    pub ticker_event_today: Option<bool>,
+    pub split_event_nearby: Option<bool>,
+}
+
+/// Cross-day sweep state the builder reads (never writes). Contents
+/// cover `[start, D-1]` only — the sweep updates them AFTER each build.
+pub struct DayContext<'a> {
+    /// Cumulative log close-to-close return per index trading day,
+    /// `[spy, qqq, iwm]` — date-aligned beta inputs.
+    pub index_cumlog: [&'a HashMap<NaiveDate, f64>; 3],
+    /// Prior days' universe signal-share values (share of valid names
+    /// with `intraday_ret_0930_to_1000 > 0`), for the trailing
+    /// point-in-time concentration percentile.
+    pub signal_share_history: &'a [f64],
 }
 
 pub fn build(
@@ -58,6 +79,7 @@ pub fn build(
     rows: &[RowInput<'_>],
     session_close: DateTime<Utc>,
     rolling: &RollingState,
+    ctx: &DayContext<'_>,
 ) -> Result<RecordBatch, ArrowError> {
     let schema = daily_observation_schema();
     let n = rows.len();
@@ -113,6 +135,38 @@ pub fn build(
     let mut bar_count_premarket = Vec::with_capacity(n);
     let mut first_rth_bar_time: Vec<Option<String>> = Vec::with_capacity(n);
     let mut minutes_after_open: Vec<Option<i32>> = Vec::with_capacity(n);
+    // First-30m / first-hour shape descriptors.
+    let mut f30_high_ret: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut f30_low_ret: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut f30_time_high: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut f30_time_low: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut f30_ret_from_high_1000: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut f30_min_since_high_1000: Vec<Option<i32>> = Vec::with_capacity(n);
+    let mut f15_share_of_30: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut fh_high_ret: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut fh_low_ret: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut fh_time_high: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut fh_ret_from_high_1030: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut f30_share_of_hour: Vec<Option<f64>> = Vec::with_capacity(n);
+    // Vol estimators + betas.
+    let mut yz: [Vec<Option<f64>>; 4] = std::array::from_fn(|_| Vec::with_capacity(n));
+    let mut beta: [Vec<Option<f64>>; 3] = std::array::from_fn(|_| Vec::with_capacity(n));
+    // Signal freshness.
+    let mut sig_first: [Vec<Option<bool>>; 3] = std::array::from_fn(|_| Vec::with_capacity(n));
+    // Remaining data quality + events.
+    let mut missing_30m: Vec<i32> = Vec::with_capacity(n);
+    let mut missing_hour: Vec<i32> = Vec::with_capacity(n);
+    let mut zero_vol_30m: Vec<i32> = Vec::with_capacity(n);
+    let mut bad_ohlc: Vec<bool> = Vec::with_capacity(n);
+    let mut prior_unadj_close: Vec<Option<f64>> = Vec::with_capacity(n);
+    let mut div_event: Vec<Option<bool>> = Vec::with_capacity(n);
+    let mut ticker_event: Vec<Option<bool>> = Vec::with_capacity(n);
+    let mut split_nearby: Vec<Option<bool>> = Vec::with_capacity(n);
+
+    let fmt_hhmm = |t: DateTime<Utc>| {
+        let e = t.with_timezone(&New_York);
+        format!("{:02}:{:02}", e.hour(), e.minute())
+    };
 
     for r in rows {
         let bars = &r.session.session.bars;
@@ -151,6 +205,69 @@ pub fn build(
         snap_vol.push((!first_30m.is_empty()).then_some(v30));
         snap_dvol.push((!first_30m.is_empty()).then_some(dv30));
         snap_vwap.push((v30 > 0.0).then(|| dv30 / v30));
+
+        // Window shape: (high, t_high, low, t_low) over a bar slice.
+        let extremes = |w: &[Bar]| {
+            w.iter().fold(None, |acc: Option<(f64, DateTime<Utc>, f64, DateTime<Utc>)>, b| {
+                Some(match acc {
+                    None => (b.high, b.t, b.low, b.t),
+                    Some((hi, hi_t, lo, lo_t)) => (
+                        if b.high > hi { b.high } else { hi },
+                        if b.high > hi { b.t } else { hi_t },
+                        if b.low < lo { b.low } else { lo },
+                        if b.low < lo { b.t } else { lo_t },
+                    ),
+                })
+            })
+        };
+
+        // First-30m shape descriptors.
+        match (rth_open_px, extremes(first_30m)) {
+            (Some(o), Some((hi, hi_t, lo, lo_t))) if o > 0.0 => {
+                f30_high_ret.push(Some(hi / o - 1.0));
+                f30_low_ret.push(Some(lo / o - 1.0));
+                f30_time_high.push(Some(fmt_hhmm(hi_t)));
+                f30_time_low.push(Some(fmt_hhmm(lo_t)));
+                let close_1000 = first_30m.last().map(|b| b.close);
+                f30_ret_from_high_1000.push(close_1000.filter(|_| hi > 0.0).map(|c| c / hi - 1.0));
+                f30_min_since_high_1000
+                    .push(Some((first_30m_end - hi_t).num_minutes() as i32));
+                let v15: f64 = slice(bars, rth_open_t, et(day, 9, 45))
+                    .iter()
+                    .map(|b| b.volume)
+                    .sum();
+                f15_share_of_30.push((v30 > 0.0).then(|| v15 / v30));
+            }
+            _ => {
+                f30_high_ret.push(None);
+                f30_low_ret.push(None);
+                f30_time_high.push(None);
+                f30_time_low.push(None);
+                f30_ret_from_high_1000.push(None);
+                f30_min_since_high_1000.push(None);
+                f15_share_of_30.push(None);
+            }
+        }
+
+        // First-hour shape descriptors.
+        match (rth_open_px, extremes(first_hour)) {
+            (Some(o), Some((hi, hi_t, lo, _))) if o > 0.0 => {
+                fh_high_ret.push(Some(hi / o - 1.0));
+                fh_low_ret.push(Some(lo / o - 1.0));
+                fh_time_high.push(Some(fmt_hhmm(hi_t)));
+                let close_1030 = first_hour.last().map(|b| b.close);
+                fh_ret_from_high_1030.push(close_1030.filter(|_| hi > 0.0).map(|c| c / hi - 1.0));
+                let vh: f64 = first_hour.iter().map(|b| b.volume).sum();
+                f30_share_of_hour.push((vh > 0.0).then(|| v30 / vh));
+            }
+            _ => {
+                fh_high_ret.push(None);
+                fh_low_ret.push(None);
+                fh_time_high.push(None);
+                fh_ret_from_high_1030.push(None);
+                f30_share_of_hour.push(None);
+            }
+        }
 
         // EOD / premarket aggregates (today's — RES-only columns).
         let f = r.adjustment_factor;
@@ -222,9 +339,78 @@ pub fn build(
         });
         days_since_first.push(hist.map(|h| h.days_since_first_bar()).unwrap_or(0));
 
+        // Vol estimators + betas (trailing, [D-N, D-1]).
+        for (vec, w) in yz.iter_mut().zip([5usize, 14, 21, 42]) {
+            vec.push(hist.and_then(|h| h.yang_zhang_vol(w)));
+        }
+        for (i, vec) in beta.iter_mut().enumerate() {
+            vec.push(hist.and_then(|h| h.beta(ctx.index_cumlog[i], 60)));
+        }
+
+        // Signal freshness: fired today AND on none of the prior N days.
+        // Unknown today → null; not fired today → false; fired but
+        // insufficient history to verify the lookback → null.
+        let fired_today = snap_ret[2].last().expect("pushed above");
+        for (vec, w) in sig_first.iter_mut().zip([5usize, 10, 20]) {
+            vec.push(match fired_today {
+                None => None,
+                Some(r) if *r <= 0.0 => Some(false),
+                Some(_) => hist
+                    .and_then(|h| h.signal_fired_in_last(w))
+                    .map(|prior_fired| !prior_fired),
+            });
+        }
+
+        prior_unadj_close.push(prior.map(|p| p.rth_close_unadjusted));
+
+        // Remaining data quality. The 30/60 expectations hold on half
+        // days too — the first hour is never truncated.
+        missing_30m.push((30 - first_30m.len() as i32).max(0));
+        missing_hour.push((60 - first_hour.len() as i32).max(0));
+        zero_vol_30m.push(first_30m.iter().filter(|b| b.volume == 0.0).count() as i32);
+        bad_ohlc.push(bars.iter().any(|b| {
+            b.high < b.low
+                || b.high < b.open
+                || b.high < b.close
+                || b.low > b.open
+                || b.low > b.close
+                || b.low <= 0.0
+        }));
+        div_event.push(r.dividend_event_today);
+        ticker_event.push(r.ticker_event_today);
+        split_nearby.push(r.split_event_nearby);
+
         first_hour_slices.push(first_hour);
         rest_10m.push(aggregate(bars, first_hour_end, rth_end, 10));
     }
+
+    // Cross-sectional ranks (within-day; rank 1 = largest; percentile =
+    // rank-based share of valid cross-section strictly below).
+    let (ret1000_rank, ret1000_pct) = ranks_desc(&snap_ret[2]);
+    let (dvol1000_rank, _) = ranks_desc(&snap_dvol);
+    let (pm_vol_rank, _) = ranks_desc(&pm[0]);
+    let (pm_dvol_rank, _) = ranks_desc(&pm[4]);
+    let (gap_rank, _) = ranks_desc(&overnight_gap);
+    let (addv20_rank, _) = ranks_desc(&addv[1]);
+    let (rvol21_rank, _) = ranks_desc(&rvol21);
+
+    // Day-level signal concentration (same value on every row).
+    let valid_signals = snap_ret[2].iter().flatten().count();
+    let fired_signals = snap_ret[2].iter().flatten().filter(|r| **r > 0.0).count();
+    let share_today = (valid_signals > 0).then(|| fired_signals as f64 / valid_signals as f64);
+    let concentration_pct = match share_today {
+        Some(s) if !ctx.signal_share_history.is_empty() => Some(
+            ctx.signal_share_history.iter().filter(|&&x| x < s).count() as f64
+                / ctx.signal_share_history.len() as f64,
+        ),
+        _ => None,
+    };
+    let hhi = {
+        let strengths: Vec<f64> =
+            snap_ret[2].iter().flatten().map(|r| r.max(0.0)).collect();
+        let tot: f64 = strengths.iter().sum();
+        (tot > 0.0).then(|| strengths.iter().map(|s| (s / tot).powi(2)).sum::<f64>())
+    };
 
     // Assemble -------------------------------------------------------------
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
@@ -328,6 +514,55 @@ pub fn build(
     );
     put("is_half_day", Arc::new(BooleanArray::from(vec![is_half_day; n])));
 
+    // Shape descriptors.
+    put("intraday_first_30m_high_return", Arc::new(Float64Array::from(f30_high_ret)));
+    put("intraday_first_30m_low_return", Arc::new(Float64Array::from(f30_low_ret)));
+    put("intraday_time_of_first_30m_high", Arc::new(StringArray::from(f30_time_high)));
+    put("intraday_time_of_first_30m_low", Arc::new(StringArray::from(f30_time_low)));
+    put("intraday_ret_from_first_30m_high_to_1000", Arc::new(Float64Array::from(f30_ret_from_high_1000)));
+    put("intraday_minutes_since_first_30m_high_at_1000", Arc::new(Int32Array::from(f30_min_since_high_1000)));
+    put("intraday_first_15m_volume_share_of_first_30m", Arc::new(Float64Array::from(f15_share_of_30)));
+    put("intraday_first_hour_high_return", Arc::new(Float64Array::from(fh_high_ret)));
+    put("intraday_first_hour_low_return", Arc::new(Float64Array::from(fh_low_ret)));
+    put("intraday_time_of_first_hour_high", Arc::new(StringArray::from(fh_time_high)));
+    put("intraday_ret_from_first_hour_high_to_1030", Arc::new(Float64Array::from(fh_ret_from_high_1030)));
+    put("intraday_first_30m_volume_share_of_first_hour", Arc::new(Float64Array::from(f30_share_of_hour)));
+
+    // Cross-sectional ranks.
+    put("intraday_ret_0930_to_1000_rank_today", Arc::new(Int32Array::from(ret1000_rank)));
+    put("intraday_ret_0930_to_1000_percentile_today", Arc::new(Float64Array::from(ret1000_pct)));
+    put("intraday_dollar_volume_0930_to_1000_rank_today", Arc::new(Int32Array::from(dvol1000_rank)));
+    put("premarket_volume_rank_today", Arc::new(Int32Array::from(pm_vol_rank)));
+    put("premarket_dollar_volume_rank_today", Arc::new(Int32Array::from(pm_dvol_rank)));
+    put("overnight_gap_rank_today", Arc::new(Int32Array::from(gap_rank)));
+    put("addv_20d_rank_today", Arc::new(Int32Array::from(addv20_rank)));
+    put("realized_vol_21d_rank_today", Arc::new(Int32Array::from(rvol21_rank)));
+
+    // Vol estimators + betas.
+    for (i, w) in ["5d", "14d", "21d", "42d"].iter().enumerate() {
+        put(&format!("yang_zhang_vol_{w}"), Arc::new(Float64Array::from(std::mem::take(&mut yz[i]))));
+    }
+    for (i, idx) in ["spy", "qqq", "iwm"].iter().enumerate() {
+        put(&format!("beta_{idx}_60d"), Arc::new(Float64Array::from(std::mem::take(&mut beta[i]))));
+    }
+
+    // Signal freshness / concentration (v2, §3.7).
+    for (i, w) in ["5d", "10d", "20d"].iter().enumerate() {
+        put(&format!("signal_first_in_{w}"), Arc::new(BooleanArray::from(std::mem::take(&mut sig_first[i]))));
+    }
+    put("signal_concentration_percentile_today", Arc::new(Float64Array::from(vec![concentration_pct; n])));
+    put("signal_concentration_hhi_today", Arc::new(Float64Array::from(vec![hhi; n])));
+
+    // Remaining data quality + events + prior unadjusted.
+    put("prior_day_unadjusted_eod_close", Arc::new(Float64Array::from(prior_unadj_close)));
+    put("missing_1m_bars_first_30m", Arc::new(Int32Array::from(missing_30m)));
+    put("missing_1m_bars_first_hour", Arc::new(Int32Array::from(missing_hour)));
+    put("zero_volume_1m_bars_first_30m", Arc::new(Int32Array::from(zero_vol_30m)));
+    put("has_bad_ohlc", Arc::new(BooleanArray::from(bad_ohlc)));
+    put("split_event_nearby", Arc::new(BooleanArray::from(split_nearby)));
+    put("dividend_event_today", Arc::new(BooleanArray::from(div_event)));
+    put("ticker_event_today", Arc::new(BooleanArray::from(ticker_event)));
+
     let columns: Vec<ArrayRef> = schema
         .fields()
         .iter()
@@ -339,6 +574,25 @@ pub fn build(
         .collect();
 
     RecordBatch::try_new(schema, columns)
+}
+
+/// Descending ranks over an optional-valued cross-section: rank 1 = the
+/// largest finite value; percentile = rank-based share of the valid
+/// cross-section strictly below (ties broken by order, documented
+/// approximation). Nulls stay null.
+fn ranks_desc(vals: &[Option<f64>]) -> (Vec<Option<i32>>, Vec<Option<f64>>) {
+    let mut idx: Vec<usize> = (0..vals.len())
+        .filter(|&i| vals[i].is_some_and(|v| v.is_finite()))
+        .collect();
+    idx.sort_by(|&a, &b| vals[b].partial_cmp(&vals[a]).expect("finite"));
+    let m = idx.len();
+    let mut rank = vec![None; vals.len()];
+    let mut pct = vec![None; vals.len()];
+    for (r0, &i) in idx.iter().enumerate() {
+        rank[i] = Some((r0 + 1) as i32);
+        pct[i] = Some((m - 1 - r0) as f64 / m as f64);
+    }
+    (rank, pct)
 }
 
 /// Build a `List<Struct<t,o,h,l,c,v>>` array (one list per row) matching
@@ -430,10 +684,22 @@ mod tests {
             .iter()
             .map(|s| RowInput {
                 session: s,
-                agg: aggregates::compute(&s.session, day, close),
+                agg: aggregates::compute(&s.session, day, close, 1.0),
                 adjustment_factor: 1.0,
+                dividend_event_today: None,
+                ticker_event_today: None,
+                split_event_nearby: None,
             })
             .collect()
+    }
+
+    fn with_empty_ctx<T>(f: impl FnOnce(&DayContext<'_>) -> T) -> T {
+        let empty: HashMap<NaiveDate, f64> = HashMap::new();
+        let ctx = DayContext {
+            index_cumlog: [&empty, &empty, &empty],
+            signal_share_history: &[],
+        };
+        f(&ctx)
     }
 
     #[test]
@@ -454,7 +720,7 @@ mod tests {
         // intraday low 102 (does NOT touch 100.5 → gap unfilled).
         let s2 = vec![mk_session(day2, "BBG1", "AAA", &[(9, 30, 103.0), (9, 45, 104.0), (12, 0, 103.5)])];
         let rows = inputs(&s2, day2, close2);
-        let batch = build(day2, &rows, close2, &rolling).unwrap();
+        let batch = with_empty_ctx(|ctx| build(day2, &rows, close2, &rolling, ctx)).unwrap();
 
         let col = |name: &str| batch.column_by_name(name).unwrap().clone();
         let f64v = |name: &str| col(name).as_primitive::<arrow::datatypes::Float64Type>().value(0);
@@ -498,7 +764,7 @@ mod tests {
         let close = et(day, 15, 59);
         let sessions = vec![mk_session(day, "BBGNEW", "NEW", &[(9, 30, 10.0)])];
         let rows = inputs(&sessions, day, close);
-        let batch = build(day, &rows, close, &RollingState::new()).unwrap();
+        let batch = with_empty_ctx(|ctx| build(day, &rows, close, &RollingState::new(), ctx)).unwrap();
 
         let dsf = batch.column_by_name("days_since_first_bar").unwrap();
         assert_eq!(dsf.as_primitive::<arrow::datatypes::Int32Type>().value(0), 0);
@@ -514,7 +780,7 @@ mod tests {
         let sessions = vec![mk_session(day, "BBGAAPL", "AAPL", &[(9, 30, 100.0)])];
         let mut rows = inputs(&sessions, day, close);
         rows[0].adjustment_factor = 0.25;
-        let batch = build(day, &rows, close, &RollingState::new()).unwrap();
+        let batch = with_empty_ctx(|ctx| build(day, &rows, close, &RollingState::new(), ctx)).unwrap();
         let v = |name: &str| {
             batch
                 .column_by_name(name)

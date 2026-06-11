@@ -146,6 +146,47 @@ pub fn write_dividends(
     Ok(())
 }
 
+/// Read `dividends.parquet` and return the set of ex-dividend dates
+/// keyed by BOTH identifiers: for every row, `(<security_id>, date)` is
+/// inserted when `security_id` is non-null, and `(<display_symbol>, date)`
+/// is always inserted. Callers can therefore probe with either a sid or
+/// a symbol without knowing which one the row carried.
+pub fn read_ex_dividend_dates(
+    path: &Path,
+) -> Result<std::collections::HashSet<(String, NaiveDate)>, WriteError> {
+    use arrow::array::{Array, AsArray};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = File::open(path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch date");
+    let mut out: std::collections::HashSet<(String, NaiveDate)> =
+        std::collections::HashSet::new();
+    for batch_res in reader {
+        let batch = batch_res?;
+        let sids = batch
+            .column_by_name("security_id")
+            .expect("security_id")
+            .as_string::<i32>();
+        let symbols = batch
+            .column_by_name("display_symbol")
+            .expect("display_symbol")
+            .as_string::<i32>();
+        let ex = batch
+            .column_by_name("ex_dividend_date")
+            .expect("ex_dividend_date")
+            .as_primitive::<arrow::datatypes::Date32Type>();
+        for i in 0..batch.num_rows() {
+            let date = epoch + chrono::Duration::days(ex.value(i) as i64);
+            if !sids.is_null(i) {
+                out.insert((sids.value(i).to_string(), date));
+            }
+            out.insert((symbols.value(i).to_string(), date));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +253,33 @@ mod tests {
             .as_primitive::<arrow::datatypes::Date32Type>();
         assert!(decl.is_null(0));
         assert!(decl.is_null(1));
+    }
+
+    #[test]
+    fn read_ex_dividend_dates_keys_by_sid_and_symbol() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dividends.parquet");
+        let rows = vec![
+            row("D1", "AAPL", "2025-08-11", 0.26),
+            row("D2", "UNKN", "2025-08-12", 0.10), // no FIGI → sid null
+        ];
+        let mut figi = HashMap::new();
+        figi.insert("AAPL".into(), "BBG000B9XRY4".into());
+        let snap = NaiveDate::from_ymd_opt(2026, 6, 7).unwrap();
+        write_dividends(&path, &rows, snap, &figi).unwrap();
+
+        let set = read_ex_dividend_dates(&path).unwrap();
+        let d1 = NaiveDate::from_ymd_opt(2025, 8, 11).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2025, 8, 12).unwrap();
+
+        // AAPL row: probeable by BOTH sid and symbol.
+        assert!(set.contains(&("BBG000B9XRY4".to_string(), d1)));
+        assert!(set.contains(&("AAPL".to_string(), d1)));
+        // UNKN row: sid was null, only the symbol key exists.
+        assert!(set.contains(&("UNKN".to_string(), d2)));
+        // No spurious cross-products.
+        assert!(!set.contains(&("BBG000B9XRY4".to_string(), d2)));
+        assert!(!set.contains(&("AAPL".to_string(), d2)));
+        assert_eq!(set.len(), 3);
     }
 }

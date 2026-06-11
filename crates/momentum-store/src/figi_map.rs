@@ -372,6 +372,17 @@ impl FigiMap {
         None
     }
 
+    /// True when a new display symbol became effective for this
+    /// `SecurityId` exactly on `day` — i.e. some window has
+    /// `valid_from == Some(day)`. Open-start windows (`valid_from =
+    /// NULL`) never match: they carry no rename event, only the
+    /// security's original/current name.
+    pub fn renamed_on(&self, sid: &SecurityId, day: NaiveDate) -> bool {
+        self.by_sid
+            .get(sid.as_str())
+            .is_some_and(|windows| windows.iter().any(|w| w.valid_from == Some(day)))
+    }
+
     /// Current display symbol — the one in the open-ended `valid_to =
     /// NULL` window. Useful for callers that don't have a specific date.
     pub fn current(&self, sid: &SecurityId) -> Option<&str> {
@@ -559,6 +570,42 @@ mod tests {
             m.resolve(&SecurityId::new("BBG000B9XRY4"), d("2018-01-01")),
             Some("AAPL")
         );
+    }
+
+    #[test]
+    fn renamed_on_matches_only_window_start_days() {
+        let rows = vec![
+            FigiMapRow {
+                security_id: "BBG000MM2P62".into(),
+                display_symbol: "FB".into(),
+                valid_from: Some(d("2012-05-18")),
+                valid_to: Some(d("2022-06-09")),
+            },
+            FigiMapRow {
+                security_id: "BBG000MM2P62".into(),
+                display_symbol: "META".into(),
+                valid_from: Some(d("2022-06-09")),
+                valid_to: None,
+            },
+            FigiMapRow {
+                security_id: "BBG000B9XRY4".into(),
+                display_symbol: "AAPL".into(),
+                valid_from: None,
+                valid_to: None,
+            },
+        ];
+        let m = FigiMap::from_rows(rows);
+        let meta = SecurityId::new("BBG000MM2P62");
+        // Both event-effective days hit.
+        assert!(m.renamed_on(&meta, d("2012-05-18")));
+        assert!(m.renamed_on(&meta, d("2022-06-09")));
+        // A day inside a window (not its start) does not.
+        assert!(!m.renamed_on(&meta, d("2022-06-08")));
+        assert!(!m.renamed_on(&meta, d("2022-06-10")));
+        // Open-start row: no rename event, never matches.
+        assert!(!m.renamed_on(&SecurityId::new("BBG000B9XRY4"), d("2012-05-18")));
+        // Unknown sid.
+        assert!(!m.renamed_on(&SecurityId::new("UNKNOWN"), d("2022-06-09")));
     }
 
     #[test]

@@ -20,6 +20,7 @@
 pub mod aggregates;
 pub mod cursor;
 pub mod daily_observation;
+pub mod market_context;
 pub mod rolling;
 pub mod slices;
 pub mod stamps;
