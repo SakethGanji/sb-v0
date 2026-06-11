@@ -25,6 +25,7 @@ use momentum_calendar::Calendar;
 use momentum_core::phase0_outputs::{daily_observation_schema, market_context_daily_schema};
 use momentum_engine::cursor::EngineCursor;
 use momentum_engine::daily_observation::{self, DayContext, RowInput};
+use momentum_engine::earnings::EarningsLookup;
 use momentum_engine::market_context::{self, IndexDay, UniverseSnapshot};
 use momentum_engine::rolling::RollingState;
 use momentum_engine::slices::{et, slice};
@@ -40,7 +41,11 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 const OBS_TABLE: &str = "daily_observation";
-const OBS_MILESTONE: &str = "B1-partial"; // earnings proximity lands in B2
+// "B2" once the derived earnings calendar is present; only
+// days_to_next_known_earnings remains null (no scheduled-earnings feed —
+// permanent for Phase 0, see momentum_engine::earnings module docs).
+const OBS_MILESTONE_WITH_EARNINGS: &str = "B2";
+const OBS_MILESTONE_NO_EARNINGS: &str = "B1-partial";
 const CTX_TABLE: &str = "market_context_daily";
 const CTX_MILESTONE: &str = "B1";
 /// "Split nearby" = execution date within ±3 calendar days of D
@@ -145,6 +150,23 @@ fn main() -> Result<()> {
             None
         }
     };
+    let earnings_path = args.out.join("earnings_calendar.parquet");
+    let earnings = match EarningsLookup::open(&earnings_path) {
+        Ok(lk) => {
+            println!("earnings calendar: {} securities", lk.securities());
+            Some(lk)
+        }
+        Err(e) => {
+            tracing::warn!(%e, path = %earnings_path.display(),
+                "earnings_calendar.parquet unavailable — run build-earnings-calendar first; earnings columns will be null");
+            None
+        }
+    };
+    let obs_milestone = if earnings.is_some() {
+        OBS_MILESTONE_WITH_EARNINGS
+    } else {
+        OBS_MILESTONE_NO_EARNINGS
+    };
 
     let days: Vec<NaiveDate> = calendar
         .trading_days()
@@ -216,6 +238,15 @@ fn main() -> Result<()> {
                         day,
                         SPLIT_NEARBY_CAL_DAYS,
                     )),
+                    days_since_last_earnings: earnings
+                        .as_ref()
+                        .and_then(|lk| lk.days_since_last(s.security_id.as_str(), day)),
+                    is_earnings_day: earnings
+                        .as_ref()
+                        .map(|lk| lk.on_day(s.security_id.as_str(), day).0),
+                    earnings_report_timing: earnings
+                        .as_ref()
+                        .and_then(|lk| lk.on_day(s.security_id.as_str(), day).1.map(String::from)),
                 })
                 .collect();
             let day_ctx = DayContext {
@@ -229,7 +260,7 @@ fn main() -> Result<()> {
                 daily_observation_schema(),
                 &batch,
                 &stamps::daily_observation_stamps(),
-                OBS_MILESTONE,
+                obs_milestone,
             )?;
             cursor.mark_done(OBS_TABLE, day)?;
             written += 1;

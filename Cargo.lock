@@ -910,6 +910,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "build-earnings-calendar"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "chrono",
+ "momentum-core",
+ "momentum-engine",
+ "momentum-store",
+ "parquet",
+]
+
+[[package]]
 name = "build-edgar-acceptance"
 version = "0.0.0"
 dependencies = [

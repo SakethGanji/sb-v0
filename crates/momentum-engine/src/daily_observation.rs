@@ -60,6 +60,15 @@ pub struct RowInput<'a> {
     pub dividend_event_today: Option<bool>,
     pub ticker_event_today: Option<bool>,
     pub split_event_nearby: Option<bool>,
+    /// Earnings proximity from the derived calendar (B2). Calendar days;
+    /// 0 = announced today (see `earnings_report_timing` for whether
+    /// that's knowable before the entry decision).
+    /// `days_to_next_known_earnings` has NO input here by design — the
+    /// SEC-filings source records announcements, not schedules, so that
+    /// column stays null until a scheduled-earnings feed is ingested.
+    pub days_since_last_earnings: Option<i32>,
+    pub is_earnings_day: Option<bool>,
+    pub earnings_report_timing: Option<String>,
 }
 
 /// Cross-day sweep state the builder reads (never writes). Contents
@@ -162,6 +171,9 @@ pub fn build(
     let mut div_event: Vec<Option<bool>> = Vec::with_capacity(n);
     let mut ticker_event: Vec<Option<bool>> = Vec::with_capacity(n);
     let mut split_nearby: Vec<Option<bool>> = Vec::with_capacity(n);
+    let mut since_earnings: Vec<Option<i32>> = Vec::with_capacity(n);
+    let mut is_earnings: Vec<Option<bool>> = Vec::with_capacity(n);
+    let mut earnings_timing: Vec<Option<String>> = Vec::with_capacity(n);
 
     let fmt_hhmm = |t: DateTime<Utc>| {
         let e = t.with_timezone(&New_York);
@@ -379,6 +391,9 @@ pub fn build(
         div_event.push(r.dividend_event_today);
         ticker_event.push(r.ticker_event_today);
         split_nearby.push(r.split_event_nearby);
+        since_earnings.push(r.days_since_last_earnings);
+        is_earnings.push(r.is_earnings_day);
+        earnings_timing.push(r.earnings_report_timing.clone());
 
         first_hour_slices.push(first_hour);
         rest_10m.push(aggregate(bars, first_hour_end, rth_end, 10));
@@ -563,6 +578,21 @@ pub fn build(
     put("dividend_event_today", Arc::new(BooleanArray::from(div_event)));
     put("ticker_event_today", Arc::new(BooleanArray::from(ticker_event)));
 
+    // Earnings proximity (B2 calendar join). days_to_next_known_earnings
+    // intentionally NOT put — null by source (SEC filings record
+    // announcements, not schedules; see RowInput docs).
+    put("days_since_last_earnings", Arc::new(Int32Array::from(since_earnings)));
+    put("is_earnings_day", Arc::new(BooleanArray::from(is_earnings)));
+    {
+        use arrow::array::StringDictionaryBuilder;
+        use arrow::datatypes::Int32Type;
+        let mut b = StringDictionaryBuilder::<Int32Type>::new();
+        for v in &earnings_timing {
+            b.append_option(v.as_deref());
+        }
+        put("earnings_report_timing", Arc::new(b.finish()));
+    }
+
     let columns: Vec<ArrayRef> = schema
         .fields()
         .iter()
@@ -689,6 +719,9 @@ mod tests {
                 dividend_event_today: None,
                 ticker_event_today: None,
                 split_event_nearby: None,
+                days_since_last_earnings: None,
+                is_earnings_day: None,
+                earnings_report_timing: None,
             })
             .collect()
     }

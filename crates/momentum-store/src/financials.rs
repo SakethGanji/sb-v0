@@ -210,6 +210,82 @@ pub fn read_snapshot_date(path: &Path) -> Result<Option<NaiveDate>, WriteError> 
     Ok(None)
 }
 
+/// The filing-identity slice of one financials row — everything the
+/// earnings-calendar derivation needs, nothing else.
+#[derive(Debug, Clone)]
+pub struct FilingLite {
+    pub security_id: Option<String>,
+    pub ticker: String,
+    pub filing_date: NaiveDate,
+    pub acceptance_datetime_ns: Option<i64>,
+    /// Last path segment of `source_filing_url` — the EDGAR accession
+    /// number, the join key for `acceptance_datetime_backfill.parquet`
+    /// (same rule as `validate_reference_data.py` §F).
+    pub accession_number: Option<String>,
+    pub timeframe: Option<String>,
+    pub fiscal_period: Option<String>,
+    pub fiscal_year: Option<String>,
+}
+
+/// Read the filing-identity columns from `financials.parquet`.
+pub fn read_filings_lite(path: &Path) -> Result<Vec<FilingLite>, WriteError> {
+    use arrow::array::{Array, AsArray};
+    use arrow::compute::cast;
+    use arrow::datatypes::{DataType, Date32Type, TimestampNanosecondType};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = File::open(path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let mut out = Vec::new();
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
+
+    for batch_res in reader {
+        let batch = batch_res?;
+        let utf8 = |name: &str| -> Result<arrow::array::ArrayRef, WriteError> {
+            Ok(cast(batch.column_by_name(name).expect(name), &DataType::Utf8)?)
+        };
+        let sid = utf8("security_id")?;
+        let sid = sid.as_string::<i32>();
+        let ticker = utf8("ticker")?;
+        let ticker = ticker.as_string::<i32>();
+        let timeframe = utf8("timeframe")?;
+        let timeframe = timeframe.as_string::<i32>();
+        let fiscal_period = utf8("fiscal_period")?;
+        let fiscal_period = fiscal_period.as_string::<i32>();
+        let fiscal_year = utf8("fiscal_year")?;
+        let fiscal_year = fiscal_year.as_string::<i32>();
+        let url = utf8("source_filing_url")?;
+        let url = url.as_string::<i32>();
+        let filing_date = batch
+            .column_by_name("filing_date")
+            .expect("filing_date")
+            .as_primitive::<Date32Type>();
+        let acceptance = batch
+            .column_by_name("acceptance_datetime")
+            .expect("acceptance_datetime")
+            .as_primitive::<TimestampNanosecondType>();
+
+        let opt_str = |arr: &arrow::array::StringArray, i: usize| {
+            (!arr.is_null(i)).then(|| arr.value(i).to_string())
+        };
+        for i in 0..batch.num_rows() {
+            out.push(FilingLite {
+                security_id: opt_str(sid, i),
+                ticker: ticker.value(i).to_string(),
+                filing_date: epoch + chrono::Duration::days(filing_date.value(i) as i64),
+                acceptance_datetime_ns: (!acceptance.is_null(i)).then(|| acceptance.value(i)),
+                accession_number: opt_str(url, i)
+                    .map(|u| u.rsplit('/').next().unwrap_or("").to_string())
+                    .filter(|a| !a.is_empty()),
+                timeframe: opt_str(timeframe, i),
+                fiscal_period: opt_str(fiscal_period, i),
+                fiscal_year: opt_str(fiscal_year, i),
+            });
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -81,6 +81,38 @@ pub fn write_acceptance_backfill(
     Ok(())
 }
 
+/// Read the backfill as `accession_number → acceptance_datetime_ns`.
+/// Join key matches `validate_reference_data.py` §F: the accession is the
+/// last path segment of `financials.source_filing_url`.
+pub fn read_acceptance_by_accession(
+    path: &Path,
+) -> Result<std::collections::HashMap<String, i64>, WriteError> {
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::TimestampNanosecondType;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = File::open(path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let mut out = std::collections::HashMap::new();
+    for batch_res in reader {
+        let batch = batch_res?;
+        let acc = batch
+            .column_by_name("accession_number")
+            .expect("accession_number")
+            .as_string::<i32>();
+        let ts = batch
+            .column_by_name("acceptance_datetime")
+            .expect("acceptance_datetime")
+            .as_primitive::<TimestampNanosecondType>();
+        for i in 0..batch.num_rows() {
+            if !ts.is_null(i) {
+                out.insert(acc.value(i).to_string(), ts.value(i));
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
