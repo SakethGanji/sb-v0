@@ -238,6 +238,20 @@ impl MaterializedBarReader {
         f
     }
 
+    /// Pin-basis split-adjustment factor for `(sid, day)` — the factor
+    /// `day_sessions` already applied to that security's prices. Engines
+    /// use it to recover unadjusted prices (`unadjusted = adjusted / f`)
+    /// for the `eod_unadjusted_*` / `adjustment_factor_on_day` columns.
+    pub fn adjustment_factor(&self, sid: &SecurityId, symbol: &str, day: NaiveDate) -> f64 {
+        let factors: &[SplitFactor] = self
+            .splits_by_sid
+            .get(sid.as_str())
+            .or_else(|| self.splits_by_symbol.get(symbol))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        Self::factor_at(factors, day)
+    }
+
     /// Bulk read: every security's session for `day` in ONE scan of the
     /// per-day file, split-adjusted. This is the engine's read path —
     /// `session_bars` re-scans the whole file per sid, which is fine for
