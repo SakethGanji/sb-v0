@@ -260,6 +260,11 @@ fn main() -> Result<()> {
     let sector_dir = args.out.join(SECTOR_TABLE);
     let class_dir = args.out.join(CLASS_TABLE);
     let mut rolling = RollingState::new();
+    // Sids ever seen under two display symbols on one day (vendor FIGI
+    // collisions). Permanently ambiguous: history purged on first
+    // detection, no pushes after — trailing columns stay honestly null
+    // for BOTH listings rather than mixing two securities.
+    let mut ambiguous_sids: std::collections::HashSet<String> = Default::default();
     // Index cum-log close returns, one map per [SPY, QQQ, IWM].
     let mut index_cumlog: [HashMap<NaiveDate, f64>; 3] = Default::default();
     let mut index_cum: [f64; 3] = [0.0; 3];
@@ -529,8 +534,14 @@ fn main() -> Result<()> {
         for s in &sessions {
             *seen.entry(s.security_id.as_str()).or_default() += 1;
         }
+        for (sid, n) in &seen {
+            if *n > 1 && !ambiguous_sids.contains(*sid) {
+                ambiguous_sids.insert((*sid).to_string());
+                rolling.remove(sid);
+            }
+        }
         for (s, agg) in sessions.iter().zip(&aggs) {
-            if seen[s.security_id.as_str()] > 1 {
+            if ambiguous_sids.contains(s.security_id.as_str()) {
                 continue;
             }
             if let Some(agg) = agg {

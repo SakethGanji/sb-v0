@@ -275,6 +275,15 @@ impl RollingState {
             .push(agg);
     }
 
+    /// Purge a sid's accumulated history. Used when a sid is detected
+    /// as ambiguous (vendor FIGI collision): INTERMITTENT collisions
+    /// would otherwise interleave two securities' histories on the days
+    /// only one of them trades — caught by the independent validation
+    /// battery (COMM/VISN sharing BBG004LTL7L2).
+    pub fn remove(&mut self, sid: &str) {
+        self.map.remove(sid);
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }

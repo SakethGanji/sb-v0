@@ -84,7 +84,14 @@ impl SharesLookup {
             }
         }
         for v in map.values_mut() {
-            v.sort_by_key(|(d, _)| *d);
+            // Deterministic tie-break for same-day filings (quarterly +
+            // annual often share a filing date with different share
+            // counts): date, then share count. Vendor file order is not
+            // stable across re-ingests.
+            v.sort_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then(a.1.partial_cmp(&b.1).expect("finite shares"))
+            });
         }
         Self { map }
     }
