@@ -195,7 +195,7 @@ struct EntryRow {
 }
 
 /// Parse an offset label like "0935" or "1530" into ET (hour, minute).
-fn offset_hm(label: &str) -> (u32, u32) {
+pub(crate) fn offset_hm(label: &str) -> (u32, u32) {
     let h: u32 = label[..2].parse().expect("offset hh");
     let m: u32 = label[2..].parse().expect("offset mm");
     (h, m)
@@ -204,7 +204,7 @@ fn offset_hm(label: &str) -> (u32, u32) {
 /// Find the entry bar: first RTH bar at/after the entry minute on day D.
 /// Returns (index into rth, halted) where halted = the exact minute was
 /// absent. None if no RTH bar at/after the entry minute exists.
-fn find_entry(rth: &[Bar], entry_t: DateTime<Utc>) -> Option<(usize, bool)> {
+pub(crate) fn find_entry(rth: &[Bar], entry_t: DateTime<Utc>) -> Option<(usize, bool)> {
     let idx = rth.iter().position(|b| b.t >= entry_t)?;
     Some((idx, rth[idx].t > entry_t))
 }
@@ -1011,39 +1011,64 @@ fn resolve_entry(
 /// D+1…D+5 full RTH) and the per-`SHORT_HORIZONS` end index into it.
 /// Intraday horizons end at the last bar ≤ entry_bar.t + N minutes within
 /// day D; `EOD` / `1d…5d` at the close of D / D+k. None = no forward data.
-fn build_tape_and_ends(inp: &ForwardInput<'_>, eidx: usize) -> (Vec<Bar>, Vec<Option<usize>>) {
+/// Build the flattened forward tape and the per-day `(start, close)` tape
+/// index bounds. `bounds[0]` is day D (from the entry bar); `bounds[k]` is
+/// D+k; None when that day has no buffered bars. Shared by the wide
+/// (forward_outcomes) and long (forward_path_short) builders.
+pub(crate) fn build_tape_with_bounds(
+    inp: &ForwardInput<'_>,
+    eidx: usize,
+) -> (Vec<Bar>, [Option<(usize, usize)>; 6]) {
     let d0 = &inp.days[0];
     let mut tape: Vec<Bar> = Vec::new();
     tape.extend_from_slice(&d0.rth_bars[eidx..]);
-    let mut day_close_idx: [Option<usize>; 6] = [None; 6];
-    day_close_idx[0] = (!tape.is_empty()).then(|| tape.len() - 1);
+    let mut bounds: [Option<(usize, usize)>; 6] = [None; 6];
+    if !tape.is_empty() {
+        bounds[0] = Some((0, tape.len() - 1));
+    }
     for k in 1..=5 {
         if let Some(fd) = inp.days.get(k) {
             if !fd.rth_bars.is_empty() {
+                let start = tape.len();
                 tape.extend_from_slice(&fd.rth_bars);
-                day_close_idx[k] = Some(tape.len() - 1);
+                bounds[k] = Some((start, tape.len() - 1));
             }
         }
     }
-    let entry_t = d0.rth_bars[eidx].t;
-    let upper = day_close_idx[0].unwrap_or(0);
+    (tape, bounds)
+}
+
+/// Last tape index within day D (≤ `day0_close`) whose bar time is
+/// ≤ `entry_t + minutes`. None if day D has no bars.
+pub(crate) fn intraday_end(
+    tape: &[Bar],
+    day0_close: Option<usize>,
+    entry_t: DateTime<Utc>,
+    minutes: i64,
+) -> Option<usize> {
+    let upper = day0_close?;
+    let cutoff = entry_t + chrono::Duration::minutes(minutes);
+    let mut last = None;
+    for (i, b) in tape.iter().enumerate().take(upper + 1) {
+        if b.t <= cutoff {
+            last = Some(i);
+        } else {
+            break;
+        }
+    }
+    last
+}
+
+fn build_tape_and_ends(inp: &ForwardInput<'_>, eidx: usize) -> (Vec<Bar>, Vec<Option<usize>>) {
+    let (tape, bounds) = build_tape_with_bounds(inp, eidx);
+    let entry_t = inp.days[0].rth_bars[eidx].t;
+    let day0_close = bounds[0].map(|(_, c)| c);
     let ends: Vec<Option<usize>> = SHORT_HORIZONS
         .iter()
         .map(|h| match h {
-            Horizon::Intraday(_, mins) => {
-                let cutoff = entry_t + chrono::Duration::minutes(*mins);
-                let mut last = None;
-                for (i, b) in tape.iter().enumerate().take(upper + 1) {
-                    if b.t <= cutoff {
-                        last = Some(i);
-                    } else {
-                        break;
-                    }
-                }
-                last
-            }
-            Horizon::Eod => day_close_idx[0],
-            Horizon::Day(_, k) => day_close_idx[*k],
+            Horizon::Intraday(_, mins) => intraday_end(&tape, day0_close, entry_t, *mins),
+            Horizon::Eod => day0_close,
+            Horizon::Day(_, k) => bounds[*k].map(|(_, c)| c),
         })
         .collect();
     (tape, ends)

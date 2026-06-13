@@ -31,9 +31,10 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, Utc};
 use momentum_calendar::Calendar;
-use momentum_core::phase0_outputs::forward_outcomes_schema;
+use momentum_core::phase0_outputs::{forward_outcomes_schema, forward_path_short_schema};
 use momentum_engine::cursor::EngineCursor;
 use momentum_engine::forward_outcomes::{self, EntryCtx, ForwardDay, ForwardInput};
+use momentum_engine::forward_path;
 use momentum_engine::stamps;
 use momentum_store::bar_reader::{DaySession, MaterializedBarReader};
 use momentum_store::figi_map::FigiMap;
@@ -45,10 +46,13 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const FWD_TABLE: &str = "forward_outcomes";
+const FWD_PATH_TABLE: &str = "forward_path_short";
 /// All B3 short-horizon families filled (horizons, crossings, labels, day-0,
 /// next-day, gap-vs-RTH, time-underwater, pre-entry ranks, cumulative volume).
+/// B4 adds `forward_path_short` (long-format checkpoints) in the same pass.
 /// B5 completes multi-day horizons + dividend totals + bar_gap + terminal events.
 const FWD_MILESTONE: &str = "B3";
+const FP_MILESTONE: &str = "B4";
 /// Forward trading days needed to finalize a day's short horizons.
 const FORWARD_DAYS: usize = 5;
 
@@ -193,22 +197,26 @@ fn build_fdays(sid: &str, buf: &VecDeque<BufferedDay>) -> Vec<ForwardDay> {
     fdays
 }
 
-fn write_table(dir: &Path, day: NaiveDate, batch: &arrow::array::RecordBatch) -> Result<()> {
+fn write_table(
+    dir: &Path,
+    day: NaiveDate,
+    schema: arrow::datatypes::SchemaRef,
+    batch: &arrow::array::RecordBatch,
+    stamps_list: &[(String, String)],
+    milestone: &str,
+) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{day}.parquet"));
-    let props = stamps::writer_props(&stamps::forward_outcomes_stamps(), FWD_MILESTONE);
+    let props = stamps::writer_props(stamps_list, milestone);
     let file = File::create(&path)?;
-    let mut w = ArrowWriter::try_new(file, forward_outcomes_schema(), Some(props))?;
+    let mut w = ArrowWriter::try_new(file, schema, Some(props))?;
     w.write(batch)?;
     w.close()?;
     Ok(())
 }
 
-fn emit_day(
-    buf: &VecDeque<BufferedDay>,
-    out: &Path,
-    fwd_dir: &Path,
-) -> Result<usize> {
+/// Writes both forward tables for the front day; returns (fo_rows, fp_rows).
+fn emit_day(buf: &VecDeque<BufferedDay>, out: &Path, fwd_dir: &Path, path_dir: &Path) -> Result<(usize, usize)> {
     let d0 = &buf[0];
     let day = d0.day;
     let ctx_path = out.join("daily_observation").join(format!("{day}.parquet"));
@@ -235,10 +243,15 @@ fn emit_day(
         })
         .collect();
 
-    let batch = forward_outcomes::build(day, &inputs)?;
-    let rows = batch.num_rows();
-    write_table(fwd_dir, day, &batch)?;
-    Ok(rows)
+    let fo = forward_outcomes::build(day, &inputs)?;
+    let fo_rows = fo.num_rows();
+    write_table(fwd_dir, day, forward_outcomes_schema(), &fo, &stamps::forward_outcomes_stamps(), FWD_MILESTONE)?;
+
+    let fp = forward_path::build(day, &inputs)?;
+    let fp_rows = fp.num_rows();
+    write_table(path_dir, day, forward_path_short_schema(), &fp, &stamps::forward_path_short_stamps(), FP_MILESTONE)?;
+
+    Ok((fo_rows, fp_rows))
 }
 
 fn main() -> Result<()> {
@@ -295,10 +308,12 @@ fn main() -> Result<()> {
     );
 
     let fwd_dir = args.out.join(FWD_TABLE);
+    let path_dir = args.out.join(FWD_PATH_TABLE);
     let mut buf: VecDeque<BufferedDay> = VecDeque::with_capacity(2 + FORWARD_DAYS);
     let mut written = 0usize;
     let mut skipped = 0usize;
-    let mut total_rows = 0usize;
+    let mut fo_rows = 0usize;
+    let mut fp_rows = 0usize;
     let sweep_t = Instant::now();
 
     let mut maybe_emit = |buf: &VecDeque<BufferedDay>| -> Result<()> {
@@ -306,16 +321,19 @@ fn main() -> Result<()> {
         if !write_set.contains(&day) {
             return Ok(());
         }
-        if cursor.is_done(FWD_TABLE, day)? && !args.force {
+        let done = cursor.is_done(FWD_TABLE, day)? && cursor.is_done(FWD_PATH_TABLE, day)?;
+        if done && !args.force {
             skipped += 1;
             return Ok(());
         }
-        let rows = emit_day(buf, &args.out, &fwd_dir)?;
+        let (fo, fp) = emit_day(buf, &args.out, &fwd_dir, &path_dir)?;
         cursor.mark_done(FWD_TABLE, day)?;
+        cursor.mark_done(FWD_PATH_TABLE, day)?;
         written += 1;
-        total_rows += rows;
+        fo_rows += fo;
+        fp_rows += fp;
         if written % 20 == 0 || written == 1 {
-            println!("  {day}: {rows} rows ({written} written, {:.1?})", sweep_t.elapsed());
+            println!("  {day}: fo={fo} fp={fp} rows ({written} written, {:.1?})", sweep_t.elapsed());
         }
         Ok(())
     };
@@ -334,7 +352,7 @@ fn main() -> Result<()> {
     }
 
     println!(
-        "done: {written} written, {skipped} skipped, {total_rows} rows, {:.1?}",
+        "done: {written} written, {skipped} skipped, forward_outcomes={fo_rows} rows, forward_path_short={fp_rows} rows, {:.1?}",
         sweep_t.elapsed()
     );
     Ok(())

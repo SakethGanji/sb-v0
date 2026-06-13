@@ -23,6 +23,7 @@ pub mod cursor;
 pub mod daily_observation;
 pub mod earnings;
 pub mod forward_outcomes;
+pub mod forward_path;
 pub mod market_context;
 pub mod regimes;
 pub mod rolling;

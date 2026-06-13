@@ -40,19 +40,21 @@ layer that consumes these tables).
 | B1 `daily_observation` + `market_context_daily` | ✅ complete & L2-validated |
 | B2 `earnings_calendar`, `sector_aggregates_daily`, `security_classification_daily`, `regime_definitions` | ✅ complete & L2-validated |
 | B3 `forward_outcomes` short horizons | ✅ **complete & L2-validated** (stamped `B3`) |
-| B4 `forward_path_short` | ⬜ **NEXT** |
-| B5 multi-day horizons + dividends + terminal events | ⬜ |
+| B4 `forward_path_short` | ✅ **complete & L2-validated** (stamped `B4`) |
+| B5 multi-day horizons + dividends + terminal events | ⬜ **NEXT** |
 | B6 golden-day fixtures + **full 2016–2026 sweep** | ⬜ |
-| Independent validation battery | ✅ 36,415/36,415 on B1+B2+B3 |
-| Workspace tests | ✅ 136 passing |
+| Independent validation battery | ✅ 67,915/67,915 on B1+B2+B3+B4 |
+| Workspace tests | ✅ 137 passing |
 | Determinism + resume-equality | ✅ byte-identical (B1/B2) |
 
 **Important:** only **144 days (2016-06-08 → 2016-12-30)** have been swept so
-far — a smoke window for fast iteration. The full 2,513-day sweep is B6. Six
-of the eight tables exist on disk for those 144 days; `forward_outcomes` and
-`forward_path_short` don't exist yet (B3–B5).
+far — a smoke window for fast iteration. The full 2,513-day sweep is B6. **All
+eight tables now exist on disk for those 144 days** (`forward_outcomes` 19.2M
+rows; `forward_path_short` 433M rows / ~16 GB). Their B5 columns
+(`forward_outcomes`: 10d+ horizons, dividend totals, bar_gap, terminal events,
+the 21d label pair) are still typed-null by design.
 
-All work through B2+validation is committed and clean. The only uncommitted
+All work through B4+validation is committed and clean. The only uncommitted
 files are `predmarket-*.md` (a different project — leave them).
 
 ---
@@ -121,10 +123,11 @@ only ever see `[D-N, D-1]`. This is the single most important invariant.
 ### Supporting bins
 
 - `write-phase0` — the trailing sweep. Writes the 4 per-day B1/B2 tables.
-- `write-forward-outcomes` — **(B3)** separate forward pass with a ~6-day
-  ring buffer; writes `forward_outcomes/` (run AFTER `write-phase0`, since it
-  reads `daily_observation[D]` for entry context). Engine module:
-  `crates/momentum-engine/src/forward_outcomes.rs`.
+- `write-forward-outcomes` — **(B3+B4)** separate forward pass with a ~6-day
+  ring buffer; writes BOTH `forward_outcomes/` (wide) and
+  `forward_path_short/` (long) in one walk (run AFTER `write-phase0`, since it
+  reads `daily_observation[D]` for entry context). Engine modules:
+  `forward_outcomes.rs` + `forward_path.rs`.
 - `build-earnings-calendar` — derives `earnings_calendar.parquet` from SEC
   filings (run BEFORE the sweep; the sweep joins it in).
 - `build-regimes` — post-pass over written `market_context_daily/` →
@@ -195,8 +198,11 @@ J (regimes full recompute) + section K (property sweep over all days) +
 **section L (B3 `forward_outcomes`: sample exact recompute × 8 names ×
 {0935,1000,1530} of every family — horizons, crossings, labels, day-0,
 next-day, gap, time-underwater, cumulative volume — plus full-universe rank
-self-consistency and a 12-invariant property sweep over all 144 days).**
-**36,415/36,415 pass.**
+self-consistency and a 12-invariant property sweep over all 144 days)** +
+**section M (B4 `forward_path_short`: per-checkpoint exact recompute of all 15
+columns for the sample + a property sweep incl. a cross-table check that
+`fp.ret` at EOD/5d_close equals `forward_outcomes.ret_<H>` over all 144 days).**
+**67,915/67,915 pass.**
 
 **Also:** `scripts/check_determinism.sh` — same day written twice is
 byte-identical, and a cursor-cleared resume reproduces the file byte-for-byte.
@@ -209,7 +215,7 @@ byte-identical, and a cursor-cleared resume reproduces the file byte-for-byte.
 
 This rule was set after B2 shipped without validator coverage; the catch-up
 session (#8) then found 2 more engine bugs. Honored through B3 (3 increments,
-each with validator coverage); do not skip it for B4.
+each with validator coverage; B4 added section M same-commit); do not skip it for B5.
 
 ---
 
@@ -278,7 +284,7 @@ announced-but-not-yet-executed future splits) — now excluded-with-warn.
 
 ---
 
-## 9. What's NEXT — B4 and the rest
+## 9. What's NEXT — B5 and the rest
 
 ### B3 — `forward_outcomes` short horizons (✅ DONE)
 
@@ -319,16 +325,22 @@ when never underwater/never recovered).
 the Phase 1 §5.1 step-0 vertical slice can fork off to de-risk the power
 question.
 
-### B4 — `forward_path_short` (NEXT)
+### B4 — `forward_path_short` (✅ DONE, stamped `B4`)
 
-23 path checkpoints (1m → 5d_close) long-format, with the +4 v2 Markov-state
-columns (`volatility_within_trade`, `rate_of_change`, `current_ret_over_atr_14d`,
-`halt_gap_crossed`). Schema coded (19 columns). **Reuses the B3 forward pass:**
-same ~6-day ring buffer + tape; emit one row per `(day, sid, entry_offset,
-checkpoint)` instead of the wide row. The checkpoint set maps onto the same
-tape indices already computed for B3 horizons/crossings, so most of the path
-math is in place — the new work is the long-format writer + the 4 path-state
-columns + validator coverage.
+23 path checkpoints (1m → 5d_close) long-format, 19 columns incl. the +4 v2
+Markov-state columns (`volatility_within_trade`, `rate_of_change`,
+`current_ret_over_atr_14d`, `halt_gap_crossed`). Built in
+`crates/momentum-engine/src/forward_path.rs` and **written in the same pass as
+`forward_outcomes`** by `bin/write-forward-outcomes` (one ring-buffer walk →
+both tables; cursor marks both `forward_outcomes` + `forward_path_short`).
+Shares the tape/bounds via `forward_outcomes::build_tape_with_bounds`. Emits 23
+checkpoints per (sid, offset) with a valid entry (none for null-entry pairs;
+vendor sid collisions yield a multiple of 23). Smoke window swept: 433M rows /
+~16 GB. Conventions (documented at the top of `forward_path.rs`): intraday
+checkpoint ends mirror the forward_outcomes caps; `bars_elapsed` = tape index;
+`volatility_within_trade` = sample stddev of per-bar returns (null < 2);
+`rate_of_change` = Δret/Δbars vs the previous checkpoint; `halt_gap_crossed`
+latches on any same-day ≥5-min bar gap (overnight gaps excluded).
 
 ### B5 — multi-day horizons + dividends + terminal events
 
@@ -384,6 +396,8 @@ Sweep order for a clean full run: `build-earnings-calendar` → `write-phase0`
 ## 11. Commit map (the build history)
 
 ```
+(this)    B4(forward_path_short): long-format 23 checkpoints + same-pass writer + §M
+ae81838  B3(forward_outcomes): pre-entry ranks + cumulative volume — B3 COMPLETE
 502320a  B3(forward_outcomes): day-0/next-day/gap/time-underwater (increment B)
 8958bcd  B3(forward_outcomes): threshold crossings + target-before-stop labels (A)
 9f43467  B3(forward_outcomes): core short-horizon columns + forward pass + L2

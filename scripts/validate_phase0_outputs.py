@@ -1955,6 +1955,211 @@ def forward_property_sweep(days_all):
 
 
 # ---------------------------------------------------------------------------
+# M. forward_path_short (B4) — sample exact recompute + property sweep
+# ---------------------------------------------------------------------------
+
+FP_CHECKPOINTS = ["1m", "2m", "3m", "5m", "10m", "15m", "20m", "30m", "45m", "60m",
+                  "90m", "120m", "180m", "EOD", "1d_open", "1d_30m", "1d_close",
+                  "2d_open", "2d_close", "3d_open", "3d_close", "5d_open", "5d_close"]
+
+
+def _fp_resolve(per_day_bars, off, atr14=None):
+    """Recompute the 23 path checkpoints for one (sym, offset). Mirrors
+    crates/momentum-engine/src/forward_path.rs. Returns {cp: {col: val}}."""
+    d0 = per_day_bars[0]
+    if not d0:
+        return None
+    em = int(off[:2]) * 60 + int(off[2:])
+    eidx = next((i for i, b in enumerate(d0) if b[0] >= em), None)
+    if eidx is None:
+        return None
+    ep = d0[eidx][1]
+    if not ep > 0:
+        return None
+    # tape + per-day (start, close) bounds
+    tape = list(d0[eidx:])
+    bounds = [(0, len(tape) - 1)] + [None] * 5
+    for k in range(1, 6):
+        if k < len(per_day_bars) and per_day_bars[k]:
+            s = len(tape); tape.extend(per_day_bars[k]); bounds[k] = (s, len(tape) - 1)
+    ebm = tape[0][0]
+    daystart = {bounds[k][0] for k in range(1, 6) if bounds[k]}
+
+    # prefix scans
+    n = len(tape)
+    mh = ml = mc = nc = None
+    sv = sd = sr = sr2 = 0.0
+    cprof = cund = 0
+    halt = False
+    P = []
+    for i, b in enumerate(tape):
+        mh = b[2] if mh is None else max(mh, b[2])
+        ml = b[3] if ml is None else min(ml, b[3])
+        mc = b[4] if mc is None else max(mc, b[4])
+        nc = b[4] if nc is None else min(nc, b[4])
+        sv += b[5]; sd += b[4] * b[5]
+        if b[4] > ep: cprof += 1
+        elif b[4] < ep: cund += 1
+        if i >= 1:
+            rr = tape[i][4] / tape[i - 1][4] - 1.0
+            sr += rr; sr2 += rr * rr
+            if i not in daystart and (tape[i][0] - tape[i - 1][0]) >= 5:
+                halt = True
+        P.append((mh, ml, mc, nc, sv, sd, cprof, cund, sr, sr2, halt))
+
+    def cp_end(cp):
+        if cp == "EOD": return bounds[0][1]
+        if cp.endswith("_open"): k = int(cp[0]); return bounds[k][0] if bounds[k] else None
+        if cp == "1d_30m":
+            if not bounds[1]: return None
+            s, c = bounds[1]; cut = tape[s][0] + 30; last = None
+            for i in range(s, c + 1):
+                if tape[i][0] <= cut: last = i
+                else: break
+            return last
+        if cp.endswith("_close"): k = int(cp[0]); return bounds[k][1] if bounds[k] else None
+        mins = int(cp[:-1]); cut = ebm + mins; last = None  # intraday Nm
+        for i in range(0, bounds[0][1] + 1):
+            if tape[i][0] <= cut: last = i
+            else: break
+        return last
+
+    atr = atr14 if (atr14 is not None and atr14 > 0) else None
+    out = {}
+    prev = (0.0, 0)
+    for cp in FP_CHECKPOINTS:
+        e = cp_end(cp)
+        if e is None or e >= n:
+            out[cp] = {c: None for c in [
+                "ret", "high_ret_so_far", "low_ret_so_far", "close_max_ret_so_far",
+                "close_min_ret_so_far", "volume_since_entry", "dollar_volume_since_entry",
+                "vwap_since_entry", "bars_elapsed", "pct_bars_profitable_so_far",
+                "pct_bars_underwater_so_far", "volatility_within_trade", "rate_of_change",
+                "current_ret_over_atr_14d", "halt_gap_crossed"]}
+            continue
+        mh, ml, mc, nc, sv, sd, cprof, cund, sr, sr2, halt = P[e]
+        ret = tape[e][4] / ep - 1.0
+        nbar = e + 1
+        vw = None
+        if e >= 2:
+            nr = e
+            var = (sr2 - sr * sr / nr) / (nr - 1)
+            vw = max(var, 0.0) ** 0.5
+        roc = (ret - prev[0]) / (e - prev[1]) if e > prev[1] else None
+        prev = (ret, e)
+        out[cp] = {
+            "ret": ret, "high_ret_so_far": mh / ep - 1.0, "low_ret_so_far": ml / ep - 1.0,
+            "close_max_ret_so_far": mc / ep - 1.0, "close_min_ret_so_far": nc / ep - 1.0,
+            "volume_since_entry": sv, "dollar_volume_since_entry": sd,
+            "vwap_since_entry": (sd / sv) if sv > 0 else None, "bars_elapsed": e,
+            "pct_bars_profitable_so_far": cprof / nbar, "pct_bars_underwater_so_far": cund / nbar,
+            "volatility_within_trade": vw, "rate_of_change": roc,
+            "current_ret_over_atr_14d": ((tape[e][4] - ep) / atr) if atr else None,
+            "halt_gap_crossed": halt,
+        }
+    return out
+
+
+def forward_path_checks(d):
+    fp_path = OUT / "forward_path_short" / f"{d}.parquet"
+    if not fp_path.exists():
+        r.check(f"{d} forward_path_short present", False, "missing")
+        return
+    sp_all, pin = _fo_splits()
+    corpus = corpus_trading_days()
+    if d not in corpus:
+        return
+    fdays = corpus[corpus.index(d):corpus.index(d) + 6]
+    daybars = {fd: load_day_bars(fd) for fd in fdays}
+    dayclose = {fd: spy_session_close(daybars[fd]) for fd in fdays}
+    do = pl.read_parquet(OUT / "daily_observation" / f"{d}.parquet",
+                         columns=["security_id", "display_symbol_on_day", "atr_14d"])
+    sym2sid, sym2atr = {}, {}
+    for row in do.iter_rows(named=True):
+        if row["display_symbol_on_day"] in SAMPLE:
+            sym2sid[row["display_symbol_on_day"]] = row["security_id"]
+            sym2atr[row["display_symbol_on_day"]] = row["atr_14d"]
+    eng = pl.read_parquet(fp_path).filter(pl.col("security_id").is_in(list(sym2sid.values())))
+    cols = ["ret", "high_ret_so_far", "low_ret_so_far", "close_max_ret_so_far",
+            "close_min_ret_so_far", "volume_since_entry", "dollar_volume_since_entry",
+            "vwap_since_entry", "bars_elapsed", "pct_bars_profitable_so_far",
+            "pct_bars_underwater_so_far", "volatility_within_trade", "rate_of_change",
+            "current_ret_over_atr_14d", "halt_gap_crossed"]
+    for sym, sid in sym2sid.items():
+        pdb = [_fo_adj_rth(daybars[fd], dayclose[fd], sym, _fo_factor(sp_all, pin, sym, fd)) for fd in fdays]
+        for off in FO_OFFSETS:
+            exp = _fp_resolve(pdb, off, sym2atr.get(sym))
+            sub = eng.filter((pl.col("security_id") == sid) & (pl.col("entry_offset") == off))
+            if exp is None:
+                r.check(f"{d} {sym}@{off} fp: no rows when no entry", sub.height == 0, f"rows={sub.height}")
+                continue
+            r.check(f"{d} {sym}@{off} fp: 23 checkpoints", sub.height == 23, f"rows={sub.height}")
+            rowmap = {row["path_checkpoint"]: row for row in sub.iter_rows(named=True)}
+            for cp in FP_CHECKPOINTS:
+                row = rowmap.get(cp)
+                if row is None:
+                    r.check(f"{d} {sym}@{off} {cp} present", False, "")
+                    continue
+                for c in cols:
+                    want = exp[cp][c]
+                    got = row[c]
+                    ok = (got == want) if (c in ("bars_elapsed", "halt_gap_crossed") or want is None or got is None) else close_enough(got, want)
+                    r.check(f"{d} {sym}@{off} {cp}.{c}", ok, f"eng={got} indep={want}")
+
+
+def forward_path_property_sweep(days_all):
+    fp_dir = OUT / "forward_path_short"
+    swept = [d for d in days_all if (fp_dir / f"{d}.parquet").exists()]
+    print(f"\n{'='*64}\nM2. forward_path_short property sweep over {len(swept)} days")
+    cpset = set(FP_CHECKPOINTS)
+    n_fields = None
+    viol = {k: 0 for k in [
+        "stamp drift", "schema drift", "checkpoint out of set",
+        "rows per (sid,offset) not multiple of 23", "ret outside [low,high]",
+        "close_max<close_min", "pct out of [0,1]", "bars_elapsed<0",
+        "cross-table ret != forward_outcomes",
+    ]}
+    for d in swept:
+        p = fp_dir / f"{d}.parquet"
+        pf = pq.ParquetFile(p)
+        meta = {k.decode(): v.decode() for k, v in pf.metadata.metadata.items()}
+        if meta.get("forward_path_checkpoints_version") != "v2" or meta.get("engine_milestone") != "B4":
+            viol["stamp drift"] += 1
+        if n_fields is None:
+            n_fields = len(pf.schema_arrow.names)
+        elif len(pf.schema_arrow.names) != n_fields:
+            viol["schema drift"] += 1
+        t = pl.read_parquet(p, columns=[
+            "security_id", "entry_offset", "path_checkpoint", "ret",
+            "high_ret_so_far", "low_ret_so_far", "close_max_ret_so_far",
+            "close_min_ret_so_far", "pct_bars_profitable_so_far", "bars_elapsed"])
+        if set(t["path_checkpoint"].unique().to_list()) - cpset:
+            viol["checkpoint out of set"] += 1
+        # 23 per (sid, offset); a vendor sid collision (two listings under one
+        # FIGI) legitimately yields a multiple of 23 (build-state §6).
+        grp = t.group_by("security_id", "entry_offset").len()
+        viol["rows per (sid,offset) not multiple of 23"] += grp.filter(pl.col("len") % 23 != 0).height
+        viol["ret outside [low,high]"] += t.filter(
+            (pl.col("ret") < pl.col("low_ret_so_far") - 1e-9)
+            | (pl.col("ret") > pl.col("high_ret_so_far") + 1e-9)).height
+        viol["close_max<close_min"] += t.filter(
+            pl.col("close_max_ret_so_far") < pl.col("close_min_ret_so_far") - 1e-9).height
+        viol["pct out of [0,1]"] += t.filter(
+            (pl.col("pct_bars_profitable_so_far") < 0) | (pl.col("pct_bars_profitable_so_far") > 1)).height
+        viol["bars_elapsed<0"] += t.filter(pl.col("bars_elapsed") < 0).height
+        # cross-table: fp.ret at aligning checkpoints == fo.ret_<H>
+        fo = pl.read_parquet(OUT / "forward_outcomes" / f"{d}.parquet",
+                             columns=["security_id", "entry_offset", "ret_EOD", "ret_5d"])
+        for cp, h in [("EOD", "ret_EOD"), ("5d_close", "ret_5d")]:
+            j = t.filter(pl.col("path_checkpoint") == cp).join(
+                fo, on=["security_id", "entry_offset"], how="inner")
+            viol["cross-table ret != forward_outcomes"] += j.filter(
+                (pl.col("ret") - pl.col(h)).abs() > 1e-9).height
+    for k, n in viol.items():
+        r.check(f"fp property: {k}", n == 0, f"violations={n}")
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -2003,10 +2208,12 @@ def main():
         sector_checks(d, obs, smap)
         classification_checks(d, obs, jr, colls, ref_idx, shares_map, praw)
         forward_outcomes_checks(d)
+        forward_path_checks(d)
 
     regime_checks(days_all)
     property_sweep(days_all)
     forward_property_sweep(days_all)
+    forward_path_property_sweep(days_all)
 
     print(f"\n{'='*64}")
     print(f"PASSED: {G}{r.passes}{X}   FAILED: {R}{r.fails}{X}")
