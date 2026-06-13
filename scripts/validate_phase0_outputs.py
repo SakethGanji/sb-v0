@@ -1599,6 +1599,79 @@ def _fo_resolve(per_day_bars, off, atr14=None):
         else: ev = "stop_first"  # da<ua or same bar (pessimistic)
         labels[name] = (ev, ev == "target_first")
 
+    # ---- Aux: day-0 segments/shape, time-underwater, next-day, gap-vs-RTH ----
+    ebm = tape[0][0]
+    dclose = d0[-1][4]
+    # ret_to_<seg>: last D bar in [entry_bar_min, seg_min].close / ep - 1
+    seg_mins = [630, 660, 690, 720, 780, 840, 900, 930, d0[-1][0]]
+    ret_to = [None] * 9
+    for i, sm in enumerate(seg_mins):
+        if sm < ebm:
+            continue
+        cand = [bb for bb in d0 if ebm <= bb[0] <= sm]
+        if cand:
+            ret_to[i] = cand[-1][4] / ep - 1.0
+    # day-0 session-shape (post-entry bars only)
+    post = d0[eidx + 1:]
+    def hilo(lo, hi):
+        seg = [bb for bb in post if bb[0] >= lo and (hi is None or bb[0] < hi)]
+        if not seg:
+            return (None, None)
+        return (max(b[2] for b in seg) / ep - 1.0, min(b[3] for b in seg) / ep - 1.0)
+    mh, ml = hilo(570, 690); dh, dl = hilo(690, 840); ah, al = hilo(840, None)
+    pw = [b for b in post if b[0] >= 900]
+    post_h = max((b[2] for b in post), default=None)
+    post_l = min((b[3] for b in post), default=None)
+    shape = [mh, ml, dh, dl, ah, al,
+             (dclose / pw[0][1] - 1.0) if pw else None,
+             (dclose / post_h - 1.0) if post_h is not None else None,
+             (dclose / post_l - 1.0) if post_l is not None else None]
+    # time-underwater (close-based) per EOD,1d,2d,3d,5d
+    uw = []
+    for lab in ["EOD", "1d", "2d", "3d", "5d"]:
+        e = ends[lab]
+        if e is None:
+            uw.append((None, None, None, None, None)); continue
+        n = e + 1
+        prof = under = cp = cu = mp = mu = 0
+        fu = rec = None
+        for i in range(n):
+            c = tape[i][4]
+            if c > ep:
+                prof += 1; cp += 1; cu = 0; mp = max(mp, cp)
+                if fu is not None and rec is None: rec = i
+            elif c < ep:
+                under += 1; cu += 1; cp = 0; mu = max(mu, cu)
+                if fu is None: fu = i
+            else:
+                cp = cu = 0
+                if fu is not None and rec is None: rec = i
+        ttr = (rec - fu) if (fu is not None and rec is not None) else 0
+        uw.append((prof / n, under / n, mp, mu, ttr))
+    # next-day (D+1)
+    nd = per_day_bars[1] if len(per_day_bars) > 1 else []
+    next_day = [None] * 11
+    if nd:
+        o = nd[0][1]; c = nd[-1][4]
+        hi = max(b[2] for b in nd); lo = min(b[3] for b in nd)
+        m0 = nd[0][0]
+        def ndp(mins):
+            cand = [b for b in nd if b[0] <= m0 + mins]
+            return cand[-1][4] / o - 1.0 if cand else None
+        next_day = [o / ep - 1.0, o / dclose - 1.0, ndp(5), ndp(15), ndp(30),
+                    hi / o - 1.0, lo / o - 1.0, c / o - 1.0,
+                    ((c - lo) / (hi - lo)) if hi > lo else None,
+                    c / hi - 1.0, c / o - 1.0]
+    # gap-vs-RTH days 1..5
+    gap_rth = [[None] * 4 for _ in range(5)]
+    prev = dclose
+    for k in range(1, 6):
+        cur = per_day_bars[k] if (k < len(per_day_bars) and per_day_bars[k]) else None
+        if cur and prev is not None:
+            o = cur[0][1]; c = cur[-1][4]
+            gap_rth[k - 1] = [o / prev - 1.0, c / o - 1.0, c / prev - 1.0, c / o - 1.0]
+        prev = cur[-1][4] if cur else None
+
     pre = d0[:eidx]
     pre_vol = sum(b[5] for b in pre)
     pre_high = max((b[2] for b in pre), default=None)
@@ -1617,6 +1690,11 @@ def _fo_resolve(per_day_bars, off, atr14=None):
         "horizons": horizons,
         "cross": cross,
         "labels": labels,
+        "ret_to": ret_to,
+        "shape": shape,
+        "uw": uw,
+        "next_day": next_day,
+        "gap_rth": gap_rth,
     }
 
 
@@ -1720,6 +1798,44 @@ def forward_outcomes_checks(d):
                         f"eng={row[f'first_event_{name}']} indep={ev}")
                 r.check(f"{tag} hit_{name}", row[f"hit_{name}"] == h_,
                         f"eng={row[f'hit_{name}']} indep={h_}")
+            # day-0 segments
+            for i, seg in enumerate(["1030", "1100", "1130", "1200", "1300", "1400", "1500", "1530", "close"]):
+                r.check(f"{tag} ret_to_{seg}", close_enough(row[f"ret_to_{seg}"], exp["ret_to"][i]),
+                        f"eng={row[f'ret_to_{seg}']} indep={exp['ret_to'][i]}")
+            # day-0 session-shape
+            for i, name in enumerate([
+                "post_entry_morning_high_return", "post_entry_morning_low_return",
+                "post_entry_midday_high_return", "post_entry_midday_low_return",
+                "post_entry_afternoon_high_return", "post_entry_afternoon_low_return",
+                "post_entry_power_hour_return", "post_entry_close_vs_high_return",
+                "post_entry_close_vs_low_return"]):
+                r.check(f"{tag} {name}", close_enough(row[name], exp["shape"][i]),
+                        f"eng={row[name]} indep={exp['shape'][i]}")
+            # time-underwater
+            for slot, hh in enumerate(["EOD", "1d", "2d", "3d", "5d"]):
+                u = exp["uw"][slot]
+                for col, want in [
+                    (f"pct_bars_profitable_{hh}", u[0]), (f"pct_bars_underwater_{hh}", u[1]),
+                    (f"max_consecutive_bars_profitable_{hh}", u[2]),
+                    (f"max_consecutive_bars_underwater_{hh}", u[3]),
+                    (f"time_to_recover_after_first_drawdown_{hh}", u[4]),
+                ]:
+                    ok = close_enough(row[col], want) if isinstance(want, float) or want is None else row[col] == want
+                    r.check(f"{tag} {col}", ok, f"eng={row[col]} indep={want}")
+            # next-day
+            for i, name in enumerate([
+                "next_day_open_return", "next_day_gap_return", "next_day_first_5m_return",
+                "next_day_first_15m_return", "next_day_first_30m_return", "next_day_high_return",
+                "next_day_low_return", "next_day_close_return", "next_day_close_location_in_range",
+                "next_day_fade_from_open", "next_day_continuation_from_open"]):
+                r.check(f"{tag} {name}", close_enough(row[name], exp["next_day"][i]),
+                        f"eng={row[name]} indep={exp['next_day'][i]}")
+            # gap-vs-RTH days 1..5
+            for k in range(1, 6):
+                for j, fam in enumerate(["gap_return", "rth_return", "close_to_close_return", "open_to_close_return"]):
+                    col = f"{fam}_day_{k}"
+                    r.check(f"{tag} {col}", close_enough(row[col], exp["gap_rth"][k - 1][j]),
+                            f"eng={row[col]} indep={exp['gap_rth'][k-1][j]}")
 
 
 def forward_property_sweep(days_all):

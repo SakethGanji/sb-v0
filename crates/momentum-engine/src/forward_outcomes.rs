@@ -181,6 +181,8 @@ struct EntryRow {
     excess: Vec<[Option<f64>; 3]>,
     // threshold crossings + target-before-stop labels (None for blank rows)
     cross: Option<CrossLabels>,
+    // day-0 segments/shape, time-underwater, next-day, gap-vs-RTH
+    aux: Option<Aux>,
 }
 
 /// Parse an offset label like "0935" or "1530" into ET (hour, minute).
@@ -196,6 +198,190 @@ fn offset_hm(label: &str) -> (u32, u32) {
 fn find_entry(rth: &[Bar], entry_t: DateTime<Utc>) -> Option<(usize, bool)> {
     let idx = rth.iter().position(|b| b.t >= entry_t)?;
     Some((idx, rth[idx].t > entry_t))
+}
+
+/// B3 third increment — day-0 segments/shape, time-underwater, next-day,
+/// gap-vs-RTH. All positional, in schema column order (see `build`).
+///
+/// Adjudicated conventions (encoded in the L2 validator):
+/// - `ret_to_<seg>` = D close at/ before the segment clock time ÷ entry − 1;
+///   null when the segment ends before the entry FILL bar.
+/// - day-0 session segments (post-entry): morning `[09:30,11:30)`, midday
+///   `[11:30,14:00)`, afternoon `[14:00, close]`, power hour `[15:00, close]`;
+///   high/low extremes taken over bars STRICTLY AFTER the entry bar within
+///   the segment, as a return from entry; null if the segment has no such bar.
+/// - time-underwater is CLOSE-based over the tape `[entry, horizon-end]`
+///   (entry bar = index 0); a bar exactly at entry is neither.
+///   `time_to_recover` = bars from first underwater bar to first subsequent
+///   recovery; 0 if never underwater or never recovered.
+/// - next-day fields are on D+1: intraday returns are vs D+1 open; the gap is
+///   D+1 open ÷ D close − 1; `open_return` is cumulative from entry.
+/// - gap-vs-RTH day k: gap = D+k open ÷ D+(k−1) close − 1; rth/open_to_close =
+///   D+k close ÷ D+k open − 1; close_to_close = D+k close ÷ D+(k−1) close − 1.
+struct Aux {
+    ret_to: [Option<f64>; 9],
+    shape: [Option<f64>; 9],
+    uw_f: [[Option<f64>; 2]; 5],
+    uw_u: [[Option<u32>; 3]; 5],
+    next_day: [Option<f64>; 11],
+    gap_rth: [[Option<f64>; 4]; 5],
+}
+
+fn day_oc(rth: &[Bar]) -> Option<(f64, f64)> {
+    (!rth.is_empty()).then(|| (rth[0].open, rth[rth.len() - 1].close))
+}
+
+fn compute_aux(
+    day: NaiveDate,
+    inp: &ForwardInput<'_>,
+    eidx: usize,
+    entry: f64,
+    tape: &[Bar],
+    ends: &[Option<usize>],
+) -> Aux {
+    let d0 = &inp.days[0];
+    let rth = &d0.rth_bars;
+    let entry_t = rth[eidx].t;
+    let post = &rth[(eidx + 1).min(rth.len())..]; // bars strictly after the fill
+    let d_close = rth[rth.len() - 1].close;
+
+    // ---- ret_to_<seg> ---- (segment clock times on day D)
+    let seg_t = [
+        et(day, 10, 30), et(day, 11, 0), et(day, 11, 30), et(day, 12, 0),
+        et(day, 13, 0), et(day, 14, 0), et(day, 15, 0), et(day, 15, 30), d0.session_close,
+    ];
+    let mut ret_to = [None; 9];
+    for (i, &t) in seg_t.iter().enumerate() {
+        if t < entry_t {
+            continue; // segment ends before the fill
+        }
+        if let Some(b) = rth.iter().rev().find(|b| b.t <= t) {
+            if b.t >= entry_t {
+                ret_to[i] = Some(b.close / entry - 1.0);
+            }
+        }
+    }
+
+    // ---- day-0 session-shape (post-entry) ----
+    let seg_hilo = |lo: DateTime<Utc>, hi: Option<DateTime<Utc>>| -> (Option<f64>, Option<f64>) {
+        let it = post.iter().filter(|b| b.t >= lo && hi.is_none_or(|h| b.t < h));
+        let mut mh = f64::NEG_INFINITY;
+        let mut ml = f64::INFINITY;
+        for b in it {
+            mh = mh.max(b.high);
+            ml = ml.min(b.low);
+        }
+        if mh == f64::NEG_INFINITY {
+            (None, None)
+        } else {
+            (Some(mh / entry - 1.0), Some(ml / entry - 1.0))
+        }
+    };
+    let (mh, ml) = seg_hilo(et(day, 9, 30), Some(et(day, 11, 30)));
+    let (dh, dl) = seg_hilo(et(day, 11, 30), Some(et(day, 14, 0)));
+    let (ah, al) = seg_hilo(et(day, 14, 0), None);
+    let power_open = post.iter().find(|b| b.t >= et(day, 15, 0)).map(|b| b.open);
+    let power = power_open.map(|o| d_close / o - 1.0);
+    let (post_hi, post_lo) = {
+        let mut h = f64::NEG_INFINITY;
+        let mut l = f64::INFINITY;
+        for b in post {
+            h = h.max(b.high);
+            l = l.min(b.low);
+        }
+        if h == f64::NEG_INFINITY { (None, None) } else { (Some(h), Some(l)) }
+    };
+    let shape = [
+        mh, ml, dh, dl, ah, al, power,
+        post_hi.map(|h| d_close / h - 1.0),
+        post_lo.map(|l| d_close / l - 1.0),
+    ];
+
+    // ---- time-underwater (close-based, per short horizon EOD,1d,2d,3d,5d) ----
+    let mut uw_f = [[None; 2]; 5];
+    let mut uw_u = [[None; 3]; 5];
+    for (slot, hi) in [3usize, 4, 5, 6, 7].into_iter().enumerate() {
+        let Some(end) = ends[hi] else { continue };
+        let n = end + 1;
+        let (mut prof, mut under) = (0u32, 0u32);
+        let (mut cur_p, mut cur_u, mut max_p, mut max_u) = (0u32, 0u32, 0u32, 0u32);
+        let (mut first_under, mut recover) = (None, None);
+        for (i, b) in tape.iter().take(n).enumerate() {
+            if b.close > entry {
+                prof += 1;
+                cur_p += 1;
+                cur_u = 0;
+                max_p = max_p.max(cur_p);
+                if first_under.is_some() && recover.is_none() {
+                    recover = Some(i);
+                }
+            } else if b.close < entry {
+                under += 1;
+                cur_u += 1;
+                cur_p = 0;
+                max_u = max_u.max(cur_u);
+                if first_under.is_none() {
+                    first_under = Some(i);
+                }
+            } else {
+                cur_p = 0;
+                cur_u = 0;
+                if first_under.is_some() && recover.is_none() {
+                    recover = Some(i); // back to flat counts as recovered
+                }
+            }
+        }
+        uw_f[slot] = [Some(prof as f64 / n as f64), Some(under as f64 / n as f64)];
+        let ttr = match (first_under, recover) {
+            (Some(f), Some(r)) => (r - f) as u32,
+            _ => 0,
+        };
+        uw_u[slot] = [Some(max_p), Some(max_u), Some(ttr)];
+    }
+
+    // ---- next-day (D+1) ----
+    let mut next_day = [None; 11];
+    if let Some(nd) = inp.days.get(1).filter(|d| !d.rth_bars.is_empty()) {
+        let b = &nd.rth_bars;
+        let (o, c) = (b[0].open, b[b.len() - 1].close);
+        let hi = b.iter().map(|x| x.high).fold(f64::NEG_INFINITY, f64::max);
+        let lo = b.iter().map(|x| x.low).fold(f64::INFINITY, f64::min);
+        let at_plus = |mins: i64| {
+            let t = b[0].t + chrono::Duration::minutes(mins);
+            b.iter().rev().find(|x| x.t <= t).map(|x| x.close / o - 1.0)
+        };
+        next_day = [
+            Some(o / entry - 1.0),          // open_return (cumulative from entry)
+            Some(o / d_close - 1.0),        // gap_return
+            at_plus(5),                     // first_5m_return
+            at_plus(15),                    // first_15m_return
+            at_plus(30),                    // first_30m_return
+            Some(hi / o - 1.0),             // high_return
+            Some(lo / o - 1.0),             // low_return
+            Some(c / o - 1.0),              // close_return
+            (hi > lo).then(|| (c - lo) / (hi - lo)), // close_location_in_range
+            Some(c / hi - 1.0),             // fade_from_open (close vs high)
+            Some(c / o - 1.0),              // continuation_from_open
+        ];
+    }
+
+    // ---- gap-vs-RTH days 1..5 ----
+    let mut gap_rth = [[None; 4]; 5];
+    let mut prev_close = Some(d_close); // D+0 close = entry day's close
+    for k in 1..=5 {
+        let cur = inp.days.get(k).and_then(|d| day_oc(&d.rth_bars));
+        if let (Some((o, c)), Some(pc)) = (cur, prev_close) {
+            gap_rth[k - 1] = [
+                Some(o / pc - 1.0),  // gap
+                Some(c / o - 1.0),   // rth
+                Some(c / pc - 1.0),  // close_to_close
+                Some(c / o - 1.0),   // open_to_close (≡ rth by definition)
+            ];
+        }
+        prev_close = cur.map(|(_, c)| c);
+    }
+
+    Aux { ret_to, shape, uw_f, uw_u, next_day, gap_rth }
 }
 
 /// Resolve all horizons for one entry on a flattened forward tape.
@@ -573,6 +759,40 @@ pub fn build(day: NaiveDate, inputs: &[ForwardInput<'_>]) -> Result<RecordBatch,
         fill.insert(leak(format!("first_event_{pair}")), Arc::new(ev) as ArrayRef);
     }
 
+    // Day-0 segments / shape, time-underwater, next-day, gap-vs-RTH (Aux).
+    for (i, seg) in ["1030", "1100", "1130", "1200", "1300", "1400", "1500", "1530", "close"].iter().enumerate() {
+        fill.insert(leak(format!("ret_to_{seg}")), Arc::new(rows.iter().map(|r| r.aux.as_ref().and_then(|a| a.ret_to[i])).collect::<Float64Array>()) as ArrayRef);
+    }
+    for (i, name) in [
+        "post_entry_morning_high_return", "post_entry_morning_low_return",
+        "post_entry_midday_high_return", "post_entry_midday_low_return",
+        "post_entry_afternoon_high_return", "post_entry_afternoon_low_return",
+        "post_entry_power_hour_return", "post_entry_close_vs_high_return",
+        "post_entry_close_vs_low_return",
+    ].iter().enumerate() {
+        fill.insert(name, Arc::new(rows.iter().map(|r| r.aux.as_ref().and_then(|a| a.shape[i])).collect::<Float64Array>()) as ArrayRef);
+    }
+    for (slot, h) in ["EOD", "1d", "2d", "3d", "5d"].iter().enumerate() {
+        fill.insert(leak(format!("pct_bars_profitable_{h}")), Arc::new(rows.iter().map(|r| r.aux.as_ref().and_then(|a| a.uw_f[slot][0])).collect::<Float64Array>()) as ArrayRef);
+        fill.insert(leak(format!("pct_bars_underwater_{h}")), Arc::new(rows.iter().map(|r| r.aux.as_ref().and_then(|a| a.uw_f[slot][1])).collect::<Float64Array>()) as ArrayRef);
+        fill.insert(leak(format!("max_consecutive_bars_profitable_{h}")), Arc::new(rows.iter().map(|r| r.aux.as_ref().and_then(|a| a.uw_u[slot][0])).collect::<UInt32Array>()) as ArrayRef);
+        fill.insert(leak(format!("max_consecutive_bars_underwater_{h}")), Arc::new(rows.iter().map(|r| r.aux.as_ref().and_then(|a| a.uw_u[slot][1])).collect::<UInt32Array>()) as ArrayRef);
+        fill.insert(leak(format!("time_to_recover_after_first_drawdown_{h}")), Arc::new(rows.iter().map(|r| r.aux.as_ref().and_then(|a| a.uw_u[slot][2])).collect::<UInt32Array>()) as ArrayRef);
+    }
+    for (i, name) in [
+        "next_day_open_return", "next_day_gap_return", "next_day_first_5m_return",
+        "next_day_first_15m_return", "next_day_first_30m_return", "next_day_high_return",
+        "next_day_low_return", "next_day_close_return", "next_day_close_location_in_range",
+        "next_day_fade_from_open", "next_day_continuation_from_open",
+    ].iter().enumerate() {
+        fill.insert(name, Arc::new(rows.iter().map(|r| r.aux.as_ref().and_then(|a| a.next_day[i])).collect::<Float64Array>()) as ArrayRef);
+    }
+    for k in 1..=5 {
+        for (j, fam) in ["gap_return", "rth_return", "close_to_close_return", "open_to_close_return"].iter().enumerate() {
+            fill.insert(leak(format!("{fam}_day_{k}")), Arc::new(rows.iter().map(|r| r.aux.as_ref().and_then(|a| a.gap_rth[k - 1][j])).collect::<Float64Array>()) as ArrayRef);
+        }
+    }
+
     // Build the batch in schema order; anything not in `fill` is a typed null.
     for field in schema.fields() {
         let a = fill.remove(field.name().as_str()).unwrap_or_else(|| new_null_array(field.data_type(), total));
@@ -642,6 +862,7 @@ fn resolve_entry(
         horizons: (0..SHORT_HORIZONS.len()).map(|_| HorizonStat::default()).collect(),
         excess: vec![[None; 3]; SHORT_HORIZONS.len()],
         cross: None,
+        aux: None,
     };
     let d0 = match inp.days.first() {
         Some(d) if !d.rth_bars.is_empty() => d,
@@ -678,11 +899,11 @@ fn resolve_entry(
     let dollar_1m = entry_bar.close * entry_bar.volume;
     let ctx = inp.entry_ctx;
 
-    // ---- horizons + crossings + labels ----
+    // ---- horizons + crossings + labels + day-0/next-day/gap families ----
     let (tape, ends) = build_tape_and_ends(inp, eidx);
     let horizons = resolve_horizons(&tape, entry_price, &ends);
     let cross = compute_cross_labels(&tape, entry_price, ctx.atr_14d, &ends);
-    let _ = day;
+    let aux = compute_aux(day, inp, eidx, entry_price, &tape, &ends);
     let excess: Vec<[Option<f64>; 3]> = horizons
         .iter()
         .enumerate()
@@ -732,6 +953,7 @@ fn resolve_entry(
         horizons,
         excess,
         cross: Some(cross),
+        aux: Some(aux),
     }
 }
 
@@ -965,5 +1187,57 @@ mod tests {
         ];
         let r2 = row(&[fday(day, flat)], "0935");
         assert_eq!(evt(&r2, "1pct_before_minus_1pct_EOD"), Some("neither"));
+    }
+
+    #[test]
+    fn time_underwater_is_close_based_with_runs_and_recovery() {
+        let day = d(2);
+        let bars = vec![
+            b(day, 9, 35, 100.0, 101.0, 99.0, 100.0, 1.0), // idx0 close=entry -> neither
+            b(day, 9, 36, 100.0, 101.5, 100.0, 101.0, 1.0), // idx1 profitable
+            b(day, 9, 37, 101.0, 101.0, 98.0, 99.0, 1.0),  // idx2 underwater (first)
+            b(day, 9, 38, 99.0, 100.0, 98.5, 99.5, 1.0),   // idx3 underwater
+            b(day, 9, 39, 99.5, 101.0, 99.5, 100.5, 1.0),  // idx4 profitable (recover)
+        ];
+        let r = row(&[fday(day, bars)], "0935");
+        let a = r.aux.as_ref().unwrap();
+        assert!((a.uw_f[0][0].unwrap() - 0.4).abs() < 1e-12); // pct profitable 2/5
+        assert!((a.uw_f[0][1].unwrap() - 0.4).abs() < 1e-12); // pct underwater 2/5
+        assert_eq!(a.uw_u[0][0], Some(1)); // max consecutive profitable
+        assert_eq!(a.uw_u[0][1], Some(2)); // max consecutive underwater
+        assert_eq!(a.uw_u[0][2], Some(2)); // time-to-recover: idx2 -> idx4
+    }
+
+    #[test]
+    fn ret_to_segment_null_before_the_entry_fill() {
+        let day = d(2);
+        let bars = vec![
+            b(day, 11, 0, 100.0, 100.0, 100.0, 100.0, 1.0),
+            b(day, 15, 59, 102.0, 102.0, 102.0, 102.0, 1.0),
+        ];
+        let r = row(&[fday(day, bars)], "1100");
+        let a = r.aux.as_ref().unwrap();
+        assert_eq!(a.ret_to[0], None); // 10:30 segment ends before the 11:00 fill
+        assert!((a.ret_to[8].unwrap() - 0.02).abs() < 1e-12); // ret_to_close
+    }
+
+    #[test]
+    fn gap_vs_rth_and_next_day_decomposition() {
+        let day0 = fday(d(2), vec![
+            b(d(2), 9, 35, 100.0, 100.0, 100.0, 100.0, 1.0),
+            b(d(2), 15, 59, 110.0, 110.0, 110.0, 110.0, 1.0),
+        ]);
+        let day1 = fday(d(3), vec![
+            b(d(3), 9, 35, 121.0, 121.0, 121.0, 121.0, 1.0),
+            b(d(3), 15, 59, 133.1, 133.1, 133.1, 133.1, 1.0),
+        ]);
+        let r = row(&[day0, day1], "0935");
+        let a = r.aux.as_ref().unwrap();
+        let g = a.gap_rth[0]; // day 1; prev close = D close 110
+        assert!((g[0].unwrap() - (121.0 / 110.0 - 1.0)).abs() < 1e-12); // gap
+        assert!((g[1].unwrap() - (133.1 / 121.0 - 1.0)).abs() < 1e-12); // rth
+        assert!((g[2].unwrap() - (133.1 / 110.0 - 1.0)).abs() < 1e-12); // close-to-close
+        assert!((g[3].unwrap() - g[1].unwrap()).abs() < 1e-12); // open_to_close ≡ rth
+        assert!((a.next_day[1].unwrap() - (121.0 / 110.0 - 1.0)).abs() < 1e-12); // next_day_gap
     }
 }
