@@ -1,0 +1,23 @@
+[package]
+name = "write-forward-outcomes"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "write-forward-outcomes"
+path = "src/main.rs"
+
+[dependencies]
+momentum-core.workspace = true
+momentum-store.workspace = true
+momentum-calendar.workspace = true
+momentum-engine.workspace = true
+anyhow = { workspace = true }
+arrow.workspace = true
+parquet.workspace = true
+chrono.workspace = true
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -39,13 +39,13 @@ layer that consumes these tables).
 | B0 engine skeleton + benchmark | ✅ done |
 | B1 `daily_observation` + `market_context_daily` | ✅ complete & L2-validated |
 | B2 `earnings_calendar`, `sector_aggregates_daily`, `security_classification_daily`, `regime_definitions` | ✅ complete & L2-validated |
-| B3 `forward_outcomes` short horizons | ⬜ **NEXT** |
+| B3 `forward_outcomes` short horizons | 🟡 **core done + L2-validated** (`B3-partial`); remaining families below |
 | B4 `forward_path_short` | ⬜ |
 | B5 multi-day horizons + dividends + terminal events | ⬜ |
 | B6 golden-day fixtures + **full 2016–2026 sweep** | ⬜ |
-| Independent validation battery | ✅ 896/896 on B1+B2 |
-| Workspace tests | ✅ 124 passing |
-| Determinism + resume-equality | ✅ byte-identical |
+| Independent validation battery | ✅ 9100/9100 on B1+B2+B3-core |
+| Workspace tests | ✅ 128 passing |
+| Determinism + resume-equality | ✅ byte-identical (B1/B2) |
 
 **Important:** only **144 days (2016-06-08 → 2016-12-30)** have been swept so
 far — a smoke window for fast iteration. The full 2,513-day sweep is B6. Six
@@ -120,7 +120,11 @@ only ever see `[D-N, D-1]`. This is the single most important invariant.
 
 ### Supporting bins
 
-- `write-phase0` — the sweep. Writes the 4 per-day tables.
+- `write-phase0` — the trailing sweep. Writes the 4 per-day B1/B2 tables.
+- `write-forward-outcomes` — **(B3)** separate forward pass with a ~6-day
+  ring buffer; writes `forward_outcomes/` (run AFTER `write-phase0`, since it
+  reads `daily_observation[D]` for entry context). Engine module:
+  `crates/momentum-engine/src/forward_outcomes.rs`.
 - `build-earnings-calendar` — derives `earnings_calendar.parquet` from SEC
   filings (run BEFORE the sweep; the sweep joins it in).
 - `build-regimes` — post-pass over written `market_context_daily/` →
@@ -139,7 +143,7 @@ only ever see `[D-N, D-1]`. This is the single most important invariant.
 
 ## 4. Per-table status
 
-**`daily_observation`** (milestone B2) — fully populated EXCEPT
+**`daily_observation`** (milestone B1) — fully populated EXCEPT
 `days_to_next_known_earnings` which is **permanently null in Phase 0** (SEC
 data records announcements, not schedules — filling it needs lookahead or a
 scheduled-earnings feed on the deferred-ingest list). Everything else: signal
@@ -187,8 +191,10 @@ unit tests share an author with the code they test (correlated blind spots).
 
 **The battery runs:** sections A–I on **4 stress days** (baseline 2016-12-30,
 half-day 2016-11-25, post-DST 2016-11-07, dataset-start 2016-06-09) + section
-J (regimes full recompute) + section K (property sweep over all 143 days).
-**896/896 pass.**
+J (regimes full recompute) + section K (property sweep over all days) +
+**section L (B3 `forward_outcomes`: sample exact recompute × 8 names ×
+{0935,1000,1530} × 8 horizons + a 9-invariant property sweep over all 144
+days).** **9100/9100 pass.**
 
 **Also:** `scripts/check_determinism.sh` — same day written twice is
 byte-identical, and a cursor-cleared resume reproduces the file byte-for-byte.
@@ -223,6 +229,17 @@ re-adjudicating** — the validator encodes them deliberately:
   accumulates again, so trailing columns stay honestly null for both listings.
 - **Rolling "prior day" = last TRADED day**, not strictly D-1 (gappy names).
 - **market_context count columns are null-when-zero-valid.**
+- **(B3) forward windows need NO cross-day split rescale.** `day_sessions`
+  already adjusts every day to the PIN basis (`factor_at(day)` folds in all
+  splits after `day`), so entry day D and forward days D+k are already on one
+  consistent basis — including windows that straddle a split. (705 splits fall
+  inside the smoke window; the validator recomputes per-day pin factors so a
+  reintroduced rescale would fail.) `entry_unadjusted = entry_price / factor_at(D)`.
+- **(B3) `forward_outcomes` entry = open of the first RTH bar at/after the
+  entry-offset minute.** When that minute is absent (gap/halt — e.g. the 15:30
+  offset on the 2016-11-25 half day, which fills at the 16:00 auction print),
+  `is_halted_at_entry=true` and intraday horizons are measured from the ACTUAL
+  fill bar, not the nominal offset (so 10/30/60min can collapse onto one bar).
 
 ---
 
@@ -260,27 +277,39 @@ announced-but-not-yet-executed future splits) — now excluded-with-warn.
 
 ## 9. What's NEXT — B3 and the rest
 
-### B3 — `forward_outcomes` short horizons (start here)
+### B3 — `forward_outcomes` short horizons (core DONE, families remaining)
 
-Intraday/EOD/1d–5d horizons (returns, max drawdown/runup, bars-to-extremes),
-fixed-% + ATR threshold crossings, market-relative (excess) returns, day-0
-session segments, next-day outcomes, gap-vs-RTH days 1-5, materialized
-target-before-stop labels, and `first_event_<pair>` (exact at 1m resolution).
-Schema already coded (657 columns total in `forward_outcomes_schema`).
+**Architecture (built):** a **separate forward pass**,
+`bin/write-forward-outcomes`, NOT folded into the chronological sweep (the
+sweep was left untouched). It walks a **~6-day ring buffer** of full 1m
+sessions (entry day D + 5 successors); day D emits once its 5 successors are
+buffered. Entry-day trailing context (atr_14d / yz_vol_14d / adv_20d /
+addv_20d, for the entry-quality normalizers) is **read back from the
+validated `daily_observation[D]`** rather than recomputed, so the pass needs
+no `RollingState`. Forward days need no split rescale (see §6). Run:
+`cargo run --release --bin write-forward-outcomes -- --from … --to …`.
 
-**Architecture note:** this needs a **forward-looking window**. The sweep is
-chronological, so day D's forward outcomes finalize once D+5's bars have
-passed. The standard approach: keep a ~7-trading-day ring buffer of full 1m
-bars. Long horizons (10d+) come later (B5) and should resolve from daily
-aggregates, not 1m (confirm against RFC §9 — there's nothing between
-`5d_close` and the wide horizons, which supports daily resolution).
+**Core DONE (`B3-partial`, L2-validated, the 8 short horizons
+`10min,30min,60min,EOD,1d,2d,3d,5d`):** identity + entry pricing, all
+pre-entry parametric features, entry-quality / fill-realism proxies,
+per-horizon ret / max_drawdown / max_runup / close-extremes / bars-to-extreme,
+and `ret_<H>_excess_{spy,qqq,iwm}`. Validator §L (sample exact recompute ×
+8 names × {0935,1000,1530}) + property sweep over all 144 days; 4 L1 unit
+tests. Smoke window swept (144 days, ~4s/day).
 
-**Tracer bullet:** once B3 writes one month, the Phase 1 §5.1 step-0 vertical
-slice can fork off (one pre-chosen question, plain conditional sorts, full
-discipline) to de-risk the power question early.
+**REMAINING B3 increments (still typed-null on disk now):** threshold
+crossings (fixed-% + ATR), day-0 session segments + session-shape,
+time-underwater, next-day outcomes, gap-vs-RTH days 1-5, `hit_`/`first_event_`
+labels (exact at 1m). Each lands with its validator coverage, then flip the
+milestone stamp `B3-partial`→`B3`. (10d–252d horizons, `ret_<H>_total` +
+dividend flags, `bar_gap_minutes_max`, terminal events are **B5**.)
 
-**GATE:** extend `scripts/validate_phase0_outputs.py` with a
-`forward_outcomes` section in the same commit.
+**Tracer bullet:** the core already writes a month+ of output, so the Phase 1
+§5.1 step-0 vertical slice can fork off now to de-risk the power question.
+
+**GATE (honored):** the `forward_outcomes` validator section landed in the
+same commit as the engine code; extend it the same way for each remaining
+family.
 
 ### B4 — `forward_path_short`
 

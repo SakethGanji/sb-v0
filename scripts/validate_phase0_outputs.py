@@ -1400,6 +1400,304 @@ def property_sweep(days_all):
 
 
 # ---------------------------------------------------------------------------
+# L. forward_outcomes (B3 short horizons) — sample exact recompute + sweep
+# ---------------------------------------------------------------------------
+#
+# Independent recompute for the SAMPLE liquid names at early/mid/late
+# offsets across the 8 short horizons. Adjustment is per-day pin factor
+# (raw * factor_at(sym,day)) — the same common basis day_sessions applies,
+# so a reintroduced cross-day rescale would surface here. Conventions
+# mirror crates/momentum-engine/src/forward_outcomes.rs:
+#   entry_price = open of the first RTH bar at/after the entry minute;
+#   forward path = RTH bars, entry bar inclusive (index 0);
+#   intraday horizons capped at D's close; 1d..5d end at D+k close.
+
+FO_OFFSETS = ["0935", "1000", "1530"]
+# (label, kind, k): kind i=intraday(minutes=k), eod, d=day(close of D+k)
+FO_HORIZONS = [
+    ("10min", "i", 10), ("30min", "i", 30), ("60min", "i", 60),
+    ("EOD", "eod", 0),
+    ("1d", "d", 1), ("2d", "d", 2), ("3d", "d", 3), ("5d", "d", 5),
+]
+
+
+def corpus_trading_days():
+    return sorted(date.fromisoformat(p.stem) for p in BARS.glob("*.parquet"))
+
+
+def _fo_splits():
+    pin = date.fromisoformat(
+        pq.ParquetFile(REF / "splits.parquet").metadata.metadata[b"splits_snapshot_date"].decode()
+    )
+    return pl.read_parquet(REF / "splits.parquet"), pin
+
+
+def _fo_factor(sp_all, pin, sym, d):
+    rows = sp_all.filter(
+        (pl.col("display_symbol") == sym)
+        & (pl.col("execution_date") > d)
+        & (pl.col("execution_date") <= pin)
+    )
+    f = 1.0
+    for fr, to in rows.select("split_from", "split_to").iter_rows():
+        f *= fr / to
+    return f
+
+
+def _fo_adj_rth(daybars, close_t, sym, factor):
+    """Adjusted RTH bars for sym on a day, as (minute, o,h,l,c,v) tuples,
+    minute = ET hour*60+min; OHLC * factor, volume / factor (pin basis)."""
+    b = (
+        daybars.filter(
+            (pl.col("display_symbol") == sym)
+            & (pl.col("et_time") >= time(9, 30))
+            & (pl.col("et_time") <= close_t)
+        )
+        .sort("t")
+    )
+    out = []
+    for row in b.iter_rows(named=True):
+        et = row["et_time"]
+        out.append((
+            et.hour * 60 + et.minute,
+            row["open"] * factor, row["high"] * factor,
+            row["low"] * factor, row["close"] * factor,
+            row["volume"] / factor,
+        ))
+    return out
+
+
+def _fo_resolve(per_day_bars, off):
+    """per_day_bars[k] = adjusted RTH bar list for D+k (k=0..5). Returns a
+    dict of recomputed columns for one entry_offset, or None if no entry."""
+    d0 = per_day_bars[0]
+    if not d0:
+        return None
+    entry_min = int(off[:2]) * 60 + int(off[2:])
+    eidx = next((i for i, b in enumerate(d0) if b[0] >= entry_min), None)
+    if eidx is None:
+        return None
+    ebar = d0[eidx]
+    ep = ebar[1]  # open
+    if not ep > 0:
+        return None
+    rth_open = d0[0][1]
+
+    tape = list(d0[eidx:])
+    day_end = [len(tape) - 1 if tape else None] + [None] * 5
+    for k in range(1, 6):
+        if k < len(per_day_bars) and per_day_bars[k]:
+            tape.extend(per_day_bars[k])
+            day_end[k] = len(tape) - 1
+
+    pref = []
+    mh = (-1e18, 0); ml = (1e18, 0); mc = (-1e18, 0); nc = (1e18, 0)
+    for i, b in enumerate(tape):
+        if b[2] > mh[0]: mh = (b[2], i)
+        if b[3] < ml[0]: ml = (b[3], i)
+        if b[4] > mc[0]: mc = (b[4], i)
+        if b[4] < nc[0]: nc = (b[4], i)
+        pref.append((mh, ml, mc, nc))
+
+    def at(end):
+        if end is None or end >= len(tape):
+            return None
+        mh, ml, mc, nc = pref[end]
+        return {
+            "ret": tape[end][4] / ep - 1.0,
+            "max_runup": mh[0] / ep - 1.0, "bars_to_max_runup": mh[1],
+            "max_drawdown": ml[0] / ep - 1.0, "bars_to_max_drawdown": ml[1],
+            "close_max_ret": mc[0] / ep - 1.0, "bars_to_close_max": mc[1],
+            "close_min_ret": nc[0] / ep - 1.0, "bars_to_close_min": nc[1],
+        }
+
+    upper = day_end[0] or 0
+    # Intraday horizons are measured from the ACTUAL entry bar, not the
+    # nominal offset (engine: cutoff = entry_bar.t + N min). They differ
+    # only when a gap/halt pushes the fill past the offset minute — e.g.
+    # the 15:30 offset on the 2016-11-25 half day fills at the 16:00
+    # auction print (is_halted_at_entry=True), and the 10/30/60min windows
+    # collapse onto that single bar. Adjudicated: engine is correct.
+    entry_bar_min = tape[0][0]
+    horizons = {}
+    for label, kind, k in FO_HORIZONS:
+        if kind == "i":
+            cap = entry_bar_min + k
+            end = None
+            for i in range(0, upper + 1):
+                if tape[i][0] <= cap:
+                    end = i
+                else:
+                    break
+            horizons[label] = at(end)
+        elif kind == "eod":
+            horizons[label] = at(day_end[0])
+        else:
+            horizons[label] = at(day_end[k])
+
+    pre = d0[:eidx]
+    pre_vol = sum(b[5] for b in pre)
+    pre_high = max((b[2] for b in pre), default=None)
+    return {
+        "entry_price": ep,
+        "is_halted_at_entry": ebar[0] > entry_min,
+        "pre_entry_ret_from_open": ep / rth_open - 1.0,
+        "pre_entry_volume_from_open": pre_vol,
+        "pre_entry_high_return_so_far": (pre_high / rth_open - 1.0) if pre else None,
+        "entry_1m_volume": ebar[5],
+        "entry_1m_range": ebar[2] - ebar[3],
+        "entry_price_location_in_1m_bar": (
+            (ebar[4] - ebar[3]) / (ebar[2] - ebar[3]) if ebar[2] > ebar[3] else None
+        ),
+        "entry_open_to_close_1m_return": ebar[4] / ebar[1] - 1.0 if ebar[1] > 0 else None,
+        "horizons": horizons,
+    }
+
+
+def forward_outcomes_checks(d):
+    fo_path = OUT / "forward_outcomes" / f"{d}.parquet"
+    if not fo_path.exists():
+        r.check(f"{d} forward_outcomes present", False, "missing — run write-forward-outcomes")
+        return
+    sp_all, pin = _fo_splits()
+    corpus = corpus_trading_days()
+    if d not in corpus:
+        return
+    i0 = corpus.index(d)
+    fdays = corpus[i0:i0 + 6]
+    daybars = {fd: load_day_bars(fd) for fd in fdays}
+    dayclose = {fd: spy_session_close(daybars[fd]) for fd in fdays}
+
+    do = pl.read_parquet(
+        OUT / "daily_observation" / f"{d}.parquet",
+        columns=["security_id", "display_symbol_on_day"],
+    )
+    sym2sid = {
+        row["display_symbol_on_day"]: row["security_id"]
+        for row in do.iter_rows(named=True)
+        if row["display_symbol_on_day"] in SAMPLE
+    }
+    eng = pl.read_parquet(fo_path).filter(
+        pl.col("security_id").is_in(list(sym2sid.values()))
+    )
+
+    sym_bars = {
+        sym: [
+            _fo_adj_rth(daybars[fd], dayclose[fd], sym, _fo_factor(sp_all, pin, sym, fd))
+            for fd in fdays
+        ]
+        for sym in sym2sid
+    }
+    spy_ret = {}
+    if "SPY" in sym_bars:
+        for off in FO_OFFSETS:
+            res = _fo_resolve(sym_bars["SPY"], off)
+            spy_ret[off] = {
+                h: (res["horizons"][h]["ret"] if res and res["horizons"][h] else None)
+                for h, _, _ in FO_HORIZONS
+            } if res else {}
+
+    for sym, sid in sym2sid.items():
+        f_d = _fo_factor(sp_all, pin, sym, d)
+        for off in FO_OFFSETS:
+            exp = _fo_resolve(sym_bars[sym], off)
+            row = eng.filter((pl.col("security_id") == sid) & (pl.col("entry_offset") == off))
+            if row.height != 1:
+                r.check(f"{d} {sym}@{off} row present", False, f"rows={row.height}")
+                continue
+            row = row.to_dicts()[0]
+            tag = f"{d} {sym}@{off}"
+            if exp is None:
+                r.check(f"{tag} entry null", row["entry_price"] is None, f"eng={row['entry_price']}")
+                continue
+            r.check(f"{tag} entry_price", close_enough(row["entry_price"], exp["entry_price"]),
+                    f"eng={row['entry_price']} indep={exp['entry_price']}")
+            r.check(f"{tag} entry_unadjusted_price",
+                    close_enough(row["entry_unadjusted_price"], exp["entry_price"] / f_d),
+                    f"eng={row['entry_unadjusted_price']} indep={exp['entry_price'] / f_d}")
+            r.check(f"{tag} is_halted_at_entry",
+                    row["is_halted_at_entry"] == exp["is_halted_at_entry"], "")
+            for col in ["pre_entry_ret_from_open", "pre_entry_volume_from_open",
+                        "pre_entry_high_return_so_far", "entry_1m_volume", "entry_1m_range",
+                        "entry_price_location_in_1m_bar", "entry_open_to_close_1m_return"]:
+                r.check(f"{tag} {col}", close_enough(row[col], exp[col]),
+                        f"eng={row[col]} indep={exp[col]}")
+            for label, _, _ in FO_HORIZONS:
+                h = exp["horizons"][label]
+                for stat, col in [
+                    ("ret", f"ret_{label}"),
+                    ("max_runup", f"max_runup_{label}"),
+                    ("max_drawdown", f"max_drawdown_{label}"),
+                    ("close_max_ret", f"close_max_ret_{label}"),
+                    ("close_min_ret", f"close_min_ret_{label}"),
+                    ("bars_to_max_runup", f"bars_to_max_runup_{label}"),
+                    ("bars_to_max_drawdown", f"bars_to_max_drawdown_{label}"),
+                    ("bars_to_close_min", f"bars_to_close_min_{label}"),
+                    ("bars_to_close_max", f"bars_to_close_max_{label}"),
+                ]:
+                    want = h[stat] if h else None
+                    r.check(f"{tag} {col}", close_enough(row[col], want),
+                            f"eng={row[col]} indep={want}")
+                want_x = None
+                if h and spy_ret.get(off, {}).get(label) is not None:
+                    want_x = h["ret"] - spy_ret[off][label]
+                r.check(f"{tag} ret_{label}_excess_spy",
+                        close_enough(row[f"ret_{label}_excess_spy"], want_x),
+                        f"eng={row[f'ret_{label}_excess_spy']} indep={want_x}")
+
+
+def forward_property_sweep(days_all):
+    fo_dir = OUT / "forward_outcomes"
+    swept = [d for d in days_all if (fo_dir / f"{d}.parquet").exists()]
+    print(f"\n{'='*64}\nL2. forward_outcomes property sweep over {len(swept)} days")
+    n_fields = None
+    viol = {k: 0 for k in [
+        "row count != universe*17", "entry_offset out of grid", "stamp drift",
+        "schema drift", "max_runup<0", "max_drawdown>0",
+        "ret_EOD outside [dd,runup]", "close_max<close_min",
+        "is_halted null when entry present",
+    ]}
+    grid = {"0935", "0940", "0945", "0950", "0955", "1000", "1005", "1010",
+            "1015", "1020", "1030", "1045", "1100", "1130", "1200", "1300", "1530"}
+    for d in swept:
+        p = fo_dir / f"{d}.parquet"
+        pf = pq.ParquetFile(p)
+        meta = {k.decode(): v.decode() for k, v in pf.metadata.metadata.items()}
+        if meta.get("forward_outcomes_version") != "v2":
+            viol["stamp drift"] += 1
+        if n_fields is None:
+            n_fields = len(pf.schema_arrow.names)
+        elif len(pf.schema_arrow.names) != n_fields:
+            viol["schema drift"] += 1
+        n_univ = pl.read_parquet(
+            OUT / "daily_observation" / f"{d}.parquet", columns=["security_id"]
+        ).height
+        t = pl.read_parquet(p, columns=[
+            "entry_offset", "entry_price", "is_halted_at_entry",
+            "max_runup_EOD", "max_drawdown_EOD", "ret_EOD",
+            "close_max_ret_EOD", "close_min_ret_EOD",
+        ])
+        if t.height != n_univ * 17:
+            viol["row count != universe*17"] += 1
+        if set(t["entry_offset"].unique().to_list()) - grid:
+            viol["entry_offset out of grid"] += 1
+        viol["max_runup<0"] += t.filter(pl.col("max_runup_EOD") < -1e-9).height
+        viol["max_drawdown>0"] += t.filter(pl.col("max_drawdown_EOD") > 1e-9).height
+        viol["ret_EOD outside [dd,runup]"] += t.filter(
+            (pl.col("ret_EOD") < pl.col("max_drawdown_EOD") - 1e-9)
+            | (pl.col("ret_EOD") > pl.col("max_runup_EOD") + 1e-9)
+        ).height
+        viol["close_max<close_min"] += t.filter(
+            pl.col("close_max_ret_EOD") < pl.col("close_min_ret_EOD") - 1e-9
+        ).height
+        viol["is_halted null when entry present"] += t.filter(
+            pl.col("entry_price").is_not_null() & pl.col("is_halted_at_entry").is_null()
+        ).height
+    for k, n in viol.items():
+        r.check(f"fo property: {k}", n == 0, f"violations={n}")
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -1447,9 +1745,11 @@ def main():
         market_context_checks(d, obs, raw, bars, close_t, praw)
         sector_checks(d, obs, smap)
         classification_checks(d, obs, jr, colls, ref_idx, shares_map, praw)
+        forward_outcomes_checks(d)
 
     regime_checks(days_all)
     property_sweep(days_all)
+    forward_property_sweep(days_all)
 
     print(f"\n{'='*64}")
     print(f"PASSED: {G}{r.passes}{X}   FAILED: {R}{r.fails}{X}")

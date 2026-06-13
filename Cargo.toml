@@ -27,6 +27,7 @@ members = [
     "bin/build-financials",
     "bin/build-edgar-acceptance",
     "bin/write-phase0",
+    "bin/write-forward-outcomes",
     "bin/build-earnings-calendar",
     "bin/build-regimes",
 ]
