@@ -159,7 +159,10 @@ stated goal (§0) demands the second.
 - `execution_cost_estimates.parquet` — Phase 3 derivation, multiple
   cost assumptions per signal.
 
-**Total v6 storage budget: ~450-650 GB.** Substantially larger than
+**Total v6 storage budget: ~450-650 GB.** (Estimates predate the v7
+`+66`-column amendment; the forward_outcomes figure now covers 657
+columns. Treat as order-of-magnitude — §13.9 covers why the exact
+number is not load-bearing.) Substantially larger than
 v5 (~120-180 GB). Driver: denser short-term outcomes, new
 forward_path_short, expanded threshold sets, security
 classification. The bump is deliberate per §0 — short-swing edge
@@ -927,10 +930,15 @@ $50 and the cheapest line item in the whole project.
 
 ### 14.1 Time-based splits only
 
-Default:
-- 2016-06-08 → 2019-12-31 — exploration
-- 2020-01-01 → 2022-06-30 — validation
-- 2022-07-01 → 2026-06-05 — holdout
+Default (train/test partition — NOT the era boundaries; see
+`phase1-research-strategy.md` §2.5 for why the two axes must not be
+conflated, and `regimes.rs::EXPLORATION_END` for the engine constant):
+- 2016-06-08 → 2020-12-31 — exploration
+- 2021-01-01 → 2022-12-31 — validation
+- 2023-01-01 → 2026-06-05 — holdout
+
+The descriptive *era* labels (2019-12-31 / 2022-06-30 / 2024-12-31
+boundaries) are a separate axis used only to characterize findings.
 
 Random splits leak future regimes.
 

@@ -21,7 +21,7 @@ from §3.7.**
 
 ## 0. Why this document exists
 
-The RFC v6 schema is correct and dynamic — 615 columns × 17 entry offsets ×
+The RFC v7 schema is correct and dynamic — 657 columns × 17 entry offsets ×
 23 path checkpoints means almost nothing is hardcoded. But "having the data"
 and "extracting the right insight from the data" are different problems.
 
@@ -102,7 +102,7 @@ calls.
 |---|---|---|---|
 | `daily_observation.parquet` | (day, security_id) | ~50-85 GB | Bars + intraday signal snapshots + first-30m/first-hour shape + premarket + overnight context + rolling vol/liquidity/betas + earnings proximity + data-quality flags + calendar |
 | `market_context_daily.parquet` | (day) | <200 MB | SPY/QQQ/IWM intraday + EOD + overnight gaps + VIX + breadth (A/D, %-green, mover counts) |
-| `forward_outcomes.parquet` | (day, security_id, entry_offset) | ~200-300 GB | 17 entry offsets × 13 horizons × 9 outcome stats + 13×7×2 fixed-% crossings + 13×6×2 ATR crossings + day-0 segments + next-day + gap-vs-RTH days 1-5 + materialized target-before-stop labels + terminal events (615 columns total) |
+| `forward_outcomes.parquet` | (day, security_id, entry_offset) | ~200-300 GB | one row per entry_offset; per row: 13 horizons × 9 outcome stats + 13×7×2 fixed-% crossings + 13×6×2 ATR crossings + day-0 segments + next-day + gap-vs-RTH days 1-5 + materialized target-before-stop labels + dividend total-return + halt-gap + first_event + terminal events (657 columns total, v2) |
 | `forward_path_short.parquet` | (day, security_id, entry_offset, checkpoint) | ~150-220 GB | 23 path checkpoints (1m → 5d_close) per trade, with running ret / high_ret_so_far / drawdown / bars_elapsed / pct_bars_profitable_so_far |
 | `regime_definitions.parquet` | (day, taxonomy, regime_id) | <50 MB | 5 taxonomies: era, spy_trend, vix_level, breadth, liquidity |
 | `earnings_calendar.parquet` | (security_id, earnings_date) | <100 MB | Derived from `financials.parquet` + EDGAR backfill; point-in-time via `announced_at_date` |
@@ -296,7 +296,7 @@ meta-labeling.
 
 Three principles tie the data, the engine, and the questions together:
 
-**A. Record everything, decide downstream.** The 615 columns × 17 offsets ×
+**A. Record everything, decide downstream.** The 657 columns × 17 offsets ×
 23 checkpoints schema deliberately over-records so that no decision is baked
 into the engine. Every entry timing, exit rule, holding period, target/stop
 combination is a query-time choice, not an engine-time hardcode. This means
@@ -339,7 +339,7 @@ survives the answer.
 
 The search space across the dataset is enormous:
 
-> 615 columns × 17 entry offsets × 23 path checkpoints × 13 horizons ×
+> 657 columns × 17 entry offsets × 23 path checkpoints × 13 horizons ×
 > ~10 classification slices × 5 regimes × 4 eras
 
 Brute-force "find the best cell" against that space yields false discoveries
@@ -685,7 +685,11 @@ choice.
 `censor_type` column (`target_hit / stop_hit / time_exit / still_open`) per
 (day, security_id, entry_offset, path_checkpoint) to support competing-risks
 fitting. Without this, the trade-ending event is ambiguous and the CIFs
-can't be computed correctly. Add this in §3.
+can't be computed correctly. **Refined 2026-06-11 — this does NOT land at
+path grain: the trade-ending event is a property of a (trade, threshold-pair),
+and the engine resolves target-vs-stop ordering exactly at 1m resolution, so
+it lands as `first_event_<pair>` in `forward_outcomes`. See the §3.2
+refinement for the final design.**
 
 **Model choice — discrete-time hazards over Cox PH.** Cox proportional
 hazards assumes a proportional baseline hazard, which intraday bar-level
@@ -958,11 +962,14 @@ mislabeled as halts, but the flag is a proxy, not a halt feed.)
 - `daily_observation` → v2 (adds signal-freshness, concentration percentile +
   HHI, position-in-52w-range, days-since-X%-move, consecutive-up-days,
   gap-filled flag, premarket-volume-spike flag).
-- `forward_path_short` → v2 (adds `censor_type`, `volatility_within_trade`,
+- `forward_path_short` → v2 (adds `volatility_within_trade`,
   `rate_of_change`, `current_ret_over_atr_14d`, `halt_gap_crossed`).
+  (`censor_type` is NOT here — see the §3.2 refinement: it moved to
+  `forward_outcomes` as `first_event_<pair>`.)
 - `forward_outcomes` → v2 (adds dividend-adjusted total-return columns +
   ex-date-within-horizon flags per §3.3, halt/bar-gap flags per §3.4,
-  cumulative pre-entry volume per §3.6).
+  cumulative pre-entry volume per §3.6, and `first_event_<pair>` for the 9
+  frozen target/stop pairs per the §3.2 refinement).
 - `market_context_daily` → v2 (adds cross-sectional dispersion + universe
   liquidity per §3.6).
 
@@ -971,10 +978,12 @@ stamps per §3.6 but no new columns), `earnings_calendar`,
 `sector_aggregates_daily`, `security_classification_daily`.
 
 **Explicit dependency note for §2.7 survival analysis:** the
-competing-risks CIF computation requires the `censor_type` column, which
-exists only in `forward_path_short` v2. The survival analysis pipeline
-*runs only on v2 data* — readers should refuse to attempt it against v1
-files and emit a clear error message.
+competing-risks fit reads `first_event_<pair>` from `forward_outcomes` v2
+(exact at 1m resolution for the 9 frozen target/stop pairs; arbitrary
+non-frozen pairs fall back to checkpoint-granularity derivation from
+`forward_path_short` path columns, and are reported as approximate). The
+survival analysis pipeline *runs only on v2 data* — readers should refuse
+to attempt it against v1 files and emit a clear error message.
 
 Stamp the new versions into Parquet file metadata so downstream readers
 refuse joins across mismatched schemas. Specifically:
