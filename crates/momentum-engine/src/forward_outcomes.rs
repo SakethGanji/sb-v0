@@ -43,7 +43,10 @@ use arrow::array::{
 use arrow::datatypes::Int32Type;
 use chrono::{DateTime, NaiveDate, Utc};
 use momentum_core::bar::Bar;
-use momentum_core::phase0_outputs::{ENTRY_OFFSETS_V1, forward_outcomes_schema};
+use momentum_core::phase0_outputs::{
+    ATR_THRESHOLDS_V2, ENTRY_OFFSETS_V1, PCT_THRESHOLDS_V2, TARGET_STOP_PAIRS_V6,
+    forward_outcomes_schema,
+};
 use std::sync::Arc;
 
 /// The 8 short horizons B3 fills, with their kind. Index horizons are
@@ -176,6 +179,8 @@ struct EntryRow {
     horizons: Vec<HorizonStat>,
     // excess per horizon × [spy,qqq,iwm]
     excess: Vec<[Option<f64>; 3]>,
+    // threshold crossings + target-before-stop labels (None for blank rows)
+    cross: Option<CrossLabels>,
 }
 
 /// Parse an offset label like "0935" or "1530" into ET (hour, minute).
@@ -195,14 +200,10 @@ fn find_entry(rth: &[Bar], entry_t: DateTime<Utc>) -> Option<(usize, bool)> {
 
 /// Resolve all horizons for one entry on a flattened forward tape.
 /// `tape` is the concatenation of D's RTH-from-entry-bar plus D+1…D+5 RTH,
-/// in time order; `day_close_idx[k]` is the index in `tape` of the last
-/// bar on D+k (k=0 is D's EOD), or None if that day isn't buffered.
-fn resolve_horizons(
-    tape: &[Bar],
-    entry_price: f64,
-    intraday_caps: &[(usize, i64)], // (tape index of last bar ≤ entry+min, minutes) per intraday horizon
-    day_close_idx: &[Option<usize>; 6],
-) -> Vec<HorizonStat> {
+/// in time order. `ends[hi]` is the tape index of the last bar in
+/// `SHORT_HORIZONS[hi]`'s window, or None if that horizon has no forward
+/// data (truncated at the corpus tail / missing day).
+fn resolve_horizons(tape: &[Bar], entry_price: f64, ends: &[Option<usize>]) -> Vec<HorizonStat> {
     // Running extremes scanned once; horizon stats read prefix maxima.
     let n = tape.len();
     let mut run_max_high = f64::NEG_INFINITY;
@@ -257,21 +258,183 @@ fn resolve_horizons(
         }
     };
 
-    let mut out = Vec::with_capacity(SHORT_HORIZONS.len());
-    let mut intraday_i = 0;
-    for h in SHORT_HORIZONS {
-        let end = match h {
-            Horizon::Intraday(_, _) => {
-                let (idx, _) = intraday_caps[intraday_i];
-                intraday_i += 1;
-                if idx == usize::MAX { None } else { Some(idx) }
-            }
-            Horizon::Eod => day_close_idx[0],
-            Horizon::Day(_, k) => day_close_idx[*k],
-        };
-        out.push(stat_at(end));
+    (0..SHORT_HORIZONS.len()).map(|hi| stat_at(ends[hi])).collect()
+}
+
+/// First-cross / target-before-stop resolution for one entry (B3 second
+/// increment). All crossings are reported as **1-based** bar indices
+/// (entry bar = 1) with `0` = "horizon reached, threshold never crossed"
+/// and `null` = "horizon has no forward data". Up-crossings test the bar
+/// HIGH (first touch of +threshold), down-crossings the bar LOW.
+struct CrossLabels {
+    /// per (short-horizon, pct-threshold): [up, down], schema order.
+    pct: Vec<Option<u32>>,
+    /// per (short-horizon, atr-threshold): [up, down]; null when atr_14d is
+    /// unavailable (can't form the price threshold).
+    atr: Vec<Option<u32>>,
+    /// per frozen pair (TARGET_STOP_PAIRS_V6 order, 9 entries; the 21d pair
+    /// is B5 → None here).
+    first_event: Vec<Option<&'static str>>,
+    hit: Vec<Option<bool>>,
+}
+
+fn pct_frac(label: &str) -> f64 {
+    label.replace('_', ".").parse::<f64>().expect("pct label") / 100.0
+}
+fn atr_mult(label: &str) -> f64 {
+    label.replace('_', ".").parse::<f64>().expect("atr label")
+}
+
+/// 1-based report: None if horizon absent; Some(0) if reached but never
+/// crossed; Some(idx+1) if first crossed at tape index `idx` within `end`.
+fn report_cross(first: Option<usize>, end: Option<usize>) -> Option<u32> {
+    match end {
+        None => None,
+        Some(e) => match first {
+            Some(idx) if idx <= e => Some(idx as u32 + 1),
+            _ => Some(0),
+        },
     }
-    out
+}
+
+fn compute_cross_labels(
+    tape: &[Bar],
+    entry_price: f64,
+    atr_14d: Option<f64>,
+    ends: &[Option<usize>],
+) -> CrossLabels {
+    let pct_fracs: Vec<f64> = PCT_THRESHOLDS_V2.iter().map(|s| pct_frac(s)).collect();
+    let atr_mults: Vec<f64> = ATR_THRESHOLDS_V2.iter().map(|s| atr_mult(s)).collect();
+    let a14 = atr_14d.filter(|a| *a > 0.0);
+
+    // Single pass: first global tape index where each threshold is touched.
+    let mut up_pct = vec![None; pct_fracs.len()];
+    let mut dn_pct = vec![None; pct_fracs.len()];
+    let mut up_atr = vec![None; atr_mults.len()];
+    let mut dn_atr = vec![None; atr_mults.len()];
+    for (i, b) in tape.iter().enumerate() {
+        let hi_ret = b.high / entry_price - 1.0;
+        let lo_ret = b.low / entry_price - 1.0;
+        for (t, &v) in pct_fracs.iter().enumerate() {
+            if up_pct[t].is_none() && hi_ret >= v {
+                up_pct[t] = Some(i);
+            }
+            if dn_pct[t].is_none() && lo_ret <= -v {
+                dn_pct[t] = Some(i);
+            }
+        }
+        if let Some(a) = a14 {
+            for (t, &m) in atr_mults.iter().enumerate() {
+                if up_atr[t].is_none() && b.high >= entry_price + m * a {
+                    up_atr[t] = Some(i);
+                }
+                if dn_atr[t].is_none() && b.low <= entry_price - m * a {
+                    dn_atr[t] = Some(i);
+                }
+            }
+        }
+    }
+
+    let mut pct = Vec::with_capacity(SHORT_HORIZONS.len() * pct_fracs.len() * 2);
+    let mut atr = Vec::with_capacity(SHORT_HORIZONS.len() * atr_mults.len() * 2);
+    for hi in 0..SHORT_HORIZONS.len() {
+        for t in 0..pct_fracs.len() {
+            pct.push(report_cross(up_pct[t], ends[hi]));
+            pct.push(report_cross(dn_pct[t], ends[hi]));
+        }
+        for t in 0..atr_mults.len() {
+            if a14.is_none() {
+                atr.push(None);
+                atr.push(None);
+            } else {
+                atr.push(report_cross(up_atr[t], ends[hi]));
+                atr.push(report_cross(dn_atr[t], ends[hi]));
+            }
+        }
+    }
+
+    // Target-before-stop labels for the 9 frozen pairs (TARGET_STOP_PAIRS_V6
+    // order). B3 fills the 8 pairs whose horizon ≤ 5d; the 21d pair is B5.
+    // Thresholds here are pair-specific (e.g. the 1.5% stop is NOT in the
+    // fixed-% column set), so each pair is resolved directly from the tape.
+    let mut first_event = vec![None; TARGET_STOP_PAIRS_V6.len()];
+    let mut hit = vec![None; TARGET_STOP_PAIRS_V6.len()];
+    let hidx = |label: &str| SHORT_HORIZONS.iter().position(|h| horizon_label(h) == label);
+    // (pair index, up threshold, down threshold, horizon label)
+    let pairs: &[(usize, Thr, Thr, &str)] = &[
+        (0, Thr::Pct(0.005), Thr::Pct(0.005), "30min"),
+        (1, Thr::Pct(0.01), Thr::Pct(0.01), "EOD"),
+        (2, Thr::Pct(0.02), Thr::Pct(0.01), "EOD"),
+        (3, Thr::Pct(0.03), Thr::Pct(0.015), "EOD"),
+        (4, Thr::Pct(0.02), Thr::Pct(0.02), "1d"),
+        (5, Thr::Pct(0.03), Thr::Pct(0.03), "5d"),
+        (6, Thr::Atr(1.0), Thr::Atr(0.5), "EOD"),
+        (7, Thr::Atr(2.0), Thr::Atr(1.0), "5d"),
+    ];
+    for &(pi, up, dn, hlabel) in pairs {
+        let end = hidx(hlabel).and_then(|hi| ends[hi]);
+        let (ev, h) = resolve_pair(tape, entry_price, a14, up, dn, end);
+        first_event[pi] = Some(ev);
+        hit[pi] = h;
+    }
+
+    CrossLabels { pct, atr, first_event, hit }
+}
+
+#[derive(Clone, Copy)]
+enum Thr {
+    Pct(f64),
+    Atr(f64),
+}
+
+/// Resolve one target/stop pair's first event within `[0, end]`. Up uses
+/// the bar HIGH, down the bar LOW; a same-bar double touch is adjudicated
+/// **stop_first** (pessimistic — intrabar order is unknowable at 1m).
+fn resolve_pair(
+    tape: &[Bar],
+    entry_price: f64,
+    atr_14d: Option<f64>,
+    up: Thr,
+    dn: Thr,
+    end: Option<usize>,
+) -> (&'static str, Option<bool>) {
+    let Some(end) = end else { return ("no_data", None) };
+    // ATR pairs need atr_14d; without it the pair is unevaluable.
+    let up_thr = match up {
+        Thr::Pct(v) => Some(entry_price * (1.0 + v)),
+        Thr::Atr(m) => atr_14d.map(|a| entry_price + m * a),
+    };
+    let dn_thr = match dn {
+        Thr::Pct(v) => Some(entry_price * (1.0 - v)),
+        Thr::Atr(m) => atr_14d.map(|a| entry_price - m * a),
+    };
+    let (Some(up_thr), Some(dn_thr)) = (up_thr, dn_thr) else { return ("no_data", None) };
+    let mut up_at = None;
+    let mut dn_at = None;
+    for (i, b) in tape.iter().enumerate().take(end + 1) {
+        if up_at.is_none() && b.high >= up_thr {
+            up_at = Some(i);
+        }
+        if dn_at.is_none() && b.low <= dn_thr {
+            dn_at = Some(i);
+        }
+        if up_at.is_some() && dn_at.is_some() {
+            break;
+        }
+    }
+    let ev = match (up_at, dn_at) {
+        (None, None) => "neither",
+        (Some(_), None) => "target_first",
+        (None, Some(_)) => "stop_first",
+        (Some(u), Some(d)) => {
+            if u < d {
+                "target_first"
+            } else {
+                "stop_first" // d < u, or same bar (pessimistic tie-break)
+            }
+        }
+    };
+    (ev, Some(ev == "target_first"))
 }
 
 pub fn build(day: NaiveDate, inputs: &[ForwardInput<'_>]) -> Result<RecordBatch, arrow::error::ArrowError> {
@@ -382,6 +545,34 @@ pub fn build(day: NaiveDate, inputs: &[ForwardInput<'_>]) -> Result<RecordBatch,
         }
     }
 
+    // Threshold crossings (1-based bar index; 0 = never within horizon;
+    // null = horizon truncated). Only the 8 short horizons are filled here;
+    // the 5 multi-day horizons stay null (B5). CrossLabels.pct/atr are laid
+    // out [up, down] per (short-horizon, threshold), matching this order.
+    let np = PCT_THRESHOLDS_V2.len();
+    let na = ATR_THRESHOLDS_V2.len();
+    for (hi, h) in SHORT_HORIZONS.iter().enumerate() {
+        let label = horizon_label(h);
+        for (ti, t) in PCT_THRESHOLDS_V2.iter().enumerate() {
+            let p = hi * np * 2 + ti * 2;
+            fill.insert(leak(format!("first_cross_up_{t}pct_{label}")), Arc::new(rows.iter().map(|r| r.cross.as_ref().and_then(|c| c.pct[p])).collect::<UInt32Array>()) as ArrayRef);
+            fill.insert(leak(format!("first_cross_down_{t}pct_{label}")), Arc::new(rows.iter().map(|r| r.cross.as_ref().and_then(|c| c.pct[p + 1])).collect::<UInt32Array>()) as ArrayRef);
+        }
+        for (ti, t) in ATR_THRESHOLDS_V2.iter().enumerate() {
+            let p = hi * na * 2 + ti * 2;
+            fill.insert(leak(format!("first_cross_up_{t}atr_{label}")), Arc::new(rows.iter().map(|r| r.cross.as_ref().and_then(|c| c.atr[p])).collect::<UInt32Array>()) as ArrayRef);
+            fill.insert(leak(format!("first_cross_down_{t}atr_{label}")), Arc::new(rows.iter().map(|r| r.cross.as_ref().and_then(|c| c.atr[p + 1])).collect::<UInt32Array>()) as ArrayRef);
+        }
+    }
+
+    // Target-before-stop: hit_<pair> (bool) + first_event_<pair> (dict).
+    // 8 of 9 pairs filled in B3; the 21d pair stays null (B5).
+    for (pi, pair) in TARGET_STOP_PAIRS_V6.iter().enumerate() {
+        fill.insert(leak(format!("hit_{pair}")), Arc::new(rows.iter().map(|r| r.cross.as_ref().and_then(|c| c.hit[pi])).collect::<BooleanArray>()) as ArrayRef);
+        let ev: DictionaryArray<Int32Type> = rows.iter().map(|r| r.cross.as_ref().and_then(|c| c.first_event[pi])).collect();
+        fill.insert(leak(format!("first_event_{pair}")), Arc::new(ev) as ArrayRef);
+    }
+
     // Build the batch in schema order; anything not in `fill` is a typed null.
     for field in schema.fields() {
         let a = fill.remove(field.name().as_str()).unwrap_or_else(|| new_null_array(field.data_type(), total));
@@ -450,6 +641,7 @@ fn resolve_entry(
         entry_dollar_volume_vs_addv_20d: None,
         horizons: (0..SHORT_HORIZONS.len()).map(|_| HorizonStat::default()).collect(),
         excess: vec![[None; 3]; SHORT_HORIZONS.len()],
+        cross: None,
     };
     let d0 = match inp.days.first() {
         Some(d) if !d.rth_bars.is_empty() => d,
@@ -486,8 +678,11 @@ fn resolve_entry(
     let dollar_1m = entry_bar.close * entry_bar.volume;
     let ctx = inp.entry_ctx;
 
-    // ---- horizons ----
-    let horizons = compute_horizons(day, inp, eidx, entry_price);
+    // ---- horizons + crossings + labels ----
+    let (tape, ends) = build_tape_and_ends(inp, eidx);
+    let horizons = resolve_horizons(&tape, entry_price, &ends);
+    let cross = compute_cross_labels(&tape, entry_price, ctx.atr_14d, &ends);
+    let _ = day;
     let excess: Vec<[Option<f64>; 3]> = horizons
         .iter()
         .enumerate()
@@ -536,13 +731,17 @@ fn resolve_entry(
         entry_dollar_volume_vs_addv_20d: ctx.addv_20d.filter(|a| *a > 0.0).map(|a| dollar_1m / a),
         horizons,
         excess,
+        cross: Some(cross),
     }
 }
 
 /// Build the flattened forward tape and resolve all short horizons.
-fn compute_horizons(day: NaiveDate, inp: &ForwardInput<'_>, eidx: usize, entry_price: f64) -> Vec<HorizonStat> {
+/// Build the flattened forward tape (D's RTH from the entry bar, then
+/// D+1…D+5 full RTH) and the per-`SHORT_HORIZONS` end index into it.
+/// Intraday horizons end at the last bar ≤ entry_bar.t + N minutes within
+/// day D; `EOD` / `1d…5d` at the close of D / D+k. None = no forward data.
+fn build_tape_and_ends(inp: &ForwardInput<'_>, eidx: usize) -> (Vec<Bar>, Vec<Option<usize>>) {
     let d0 = &inp.days[0];
-    // Tape = D's RTH from entry bar onward, then D+1…D+5 full RTH.
     let mut tape: Vec<Bar> = Vec::new();
     tape.extend_from_slice(&d0.rth_bars[eidx..]);
     let mut day_close_idx: [Option<usize>; 6] = [None; 6];
@@ -555,31 +754,28 @@ fn compute_horizons(day: NaiveDate, inp: &ForwardInput<'_>, eidx: usize, entry_p
             }
         }
     }
-    // Intraday caps: last tape index with t ≤ entry_t + N minutes, on day D.
     let entry_t = d0.rth_bars[eidx].t;
-    let intraday_caps: Vec<(usize, i64)> = SHORT_HORIZONS
+    let upper = day_close_idx[0].unwrap_or(0);
+    let ends: Vec<Option<usize>> = SHORT_HORIZONS
         .iter()
-        .filter_map(|hz| match hz {
-            Horizon::Intraday(_, mins) => Some(*mins),
-            _ => None,
-        })
-        .map(|mins| {
-            let cutoff = entry_t + chrono::Duration::minutes(mins);
-            // search within D's portion of the tape (indices 0..=day_close_idx[0])
-            let upper = day_close_idx[0].unwrap_or(0);
-            let mut last = usize::MAX;
-            for (i, b) in tape.iter().enumerate().take(upper + 1) {
-                if b.t <= cutoff {
-                    last = i;
-                } else {
-                    break;
+        .map(|h| match h {
+            Horizon::Intraday(_, mins) => {
+                let cutoff = entry_t + chrono::Duration::minutes(*mins);
+                let mut last = None;
+                for (i, b) in tape.iter().enumerate().take(upper + 1) {
+                    if b.t <= cutoff {
+                        last = Some(i);
+                    } else {
+                        break;
+                    }
                 }
+                last
             }
-            (last, mins)
+            Horizon::Eod => day_close_idx[0],
+            Horizon::Day(_, k) => day_close_idx[*k],
         })
         .collect();
-    let _ = day;
-    resolve_horizons(&tape, entry_price, &intraday_caps, &day_close_idx)
+    (tape, ends)
 }
 
 #[cfg(test)]
@@ -675,5 +871,99 @@ mod tests {
         assert_eq!(r.entry_price, Some(200.0)); // open of the 16:00 fill bar
         let ten = &r.horizons[hidx("10min")];
         assert!((ten.ret.unwrap() - (200.5 / 200.0 - 1.0)).abs() < 1e-12);
+    }
+
+    fn cross_pct(r: &EntryRow, h: &str, t: &str, down: bool) -> Option<u32> {
+        let c = r.cross.as_ref().unwrap();
+        let hi = SHORT_HORIZONS.iter().position(|x| horizon_label(x) == h).unwrap();
+        let ti = PCT_THRESHOLDS_V2.iter().position(|x| *x == t).unwrap();
+        c.pct[hi * PCT_THRESHOLDS_V2.len() * 2 + ti * 2 + down as usize]
+    }
+    fn cross_atr(r: &EntryRow, h: &str, t: &str, down: bool) -> Option<u32> {
+        let c = r.cross.as_ref().unwrap();
+        let hi = SHORT_HORIZONS.iter().position(|x| horizon_label(x) == h).unwrap();
+        let ti = ATR_THRESHOLDS_V2.iter().position(|x| *x == t).unwrap();
+        c.atr[hi * ATR_THRESHOLDS_V2.len() * 2 + ti * 2 + down as usize]
+    }
+    fn evt(r: &EntryRow, pair: &str) -> Option<&'static str> {
+        let c = r.cross.as_ref().unwrap();
+        c.first_event[TARGET_STOP_PAIRS_V6.iter().position(|p| *p == pair).unwrap()]
+    }
+
+    // Rising-then-dipping path (thresholds cleared by a margin to avoid
+    // f64 boundary effects): +0.6% @idx1, +1.2% @idx2, -1.1% @idx3.
+    fn cross_bars(day: NaiveDate) -> Vec<Bar> {
+        vec![
+            b(day, 9, 35, 100.0, 100.0, 100.0, 100.0, 1.0),
+            b(day, 9, 36, 100.0, 100.6, 100.0, 100.3, 1.0),
+            b(day, 9, 37, 100.3, 101.2, 100.0, 101.0, 1.0),
+            b(day, 9, 38, 101.0, 101.0, 98.9, 99.0, 1.0),
+            b(day, 9, 39, 99.0, 99.0, 99.0, 99.0, 1.0),
+        ]
+    }
+
+    #[test]
+    fn crossings_are_1based_with_zero_for_never_and_null_when_absent() {
+        let r = row(&[fday(d(2), cross_bars(d(2)))], "0935");
+        // 1-based bar indices (entry bar = 1):
+        assert_eq!(cross_pct(&r, "EOD", "0_5", false), Some(2)); // +0.5% high @idx1
+        assert_eq!(cross_pct(&r, "EOD", "1", false), Some(3)); // +1% high @idx2
+        assert_eq!(cross_pct(&r, "EOD", "2", false), Some(0)); // +2% never (reached EOD)
+        assert_eq!(cross_pct(&r, "EOD", "1", true), Some(4)); // -1% low @idx3
+        // 1d horizon has no forward data -> null, not 0
+        assert_eq!(cross_pct(&r, "1d", "1", false), None);
+    }
+
+    #[test]
+    fn atr_crossings_use_price_thresholds_and_null_without_atr() {
+        let day = d(2);
+        let bars = cross_bars(day);
+        // with atr_14d = 1.0: +1 ATR = 101 -> first high>=101 at idx2 -> 3
+        let inp = ForwardInput {
+            security_id: "X",
+            display_symbol: "X",
+            days: &[fday(day, bars.clone())],
+            entry_ctx: EntryCtx { atr_14d: Some(1.0), ..Default::default() },
+            entry_day_factor: 1.0,
+        };
+        let r = resolve_entry(day, &inp, "0935", &Default::default());
+        assert_eq!(cross_atr(&r, "EOD", "1", false), Some(3));
+        assert_eq!(cross_atr(&r, "EOD", "3", false), Some(0)); // +3 ATR never
+        // without atr_14d, atr crossings are null
+        let r2 = row(&[fday(day, bars)], "0935");
+        assert_eq!(cross_atr(&r2, "EOD", "1", false), None);
+    }
+
+    #[test]
+    fn target_before_stop_labels() {
+        // target_first: +1% (@idx2) before -1% (@idx3) within EOD
+        let r = row(&[fday(d(2), cross_bars(d(2)))], "0935");
+        assert_eq!(evt(&r, "1pct_before_minus_1pct_EOD"), Some("target_first"));
+        let c = r.cross.as_ref().unwrap();
+        let pi = TARGET_STOP_PAIRS_V6.iter().position(|p| *p == "1pct_before_minus_1pct_EOD").unwrap();
+        assert_eq!(c.hit[pi], Some(true));
+        // 21d pair is B5 -> null
+        let p21 = TARGET_STOP_PAIRS_V6.iter().position(|p| *p == "3atr_before_minus_1_5atr_21d").unwrap();
+        assert_eq!(c.first_event[p21], None);
+    }
+
+    #[test]
+    fn stop_first_and_neither_labels() {
+        let day = d(2);
+        // drops to -1.1% (@idx1 low 98.9) before ever reaching +1%
+        let down_first = vec![
+            b(day, 9, 35, 100.0, 100.0, 100.0, 100.0, 1.0),
+            b(day, 9, 36, 100.0, 100.2, 98.9, 99.5, 1.0),
+            b(day, 9, 37, 99.5, 100.4, 99.5, 100.3, 1.0),
+        ];
+        let r = row(&[fday(day, down_first)], "0935");
+        assert_eq!(evt(&r, "1pct_before_minus_1pct_EOD"), Some("stop_first"));
+        // flat path: neither +1% nor -1%
+        let flat = vec![
+            b(day, 9, 35, 100.0, 100.1, 99.9, 100.0, 1.0),
+            b(day, 9, 36, 100.0, 100.2, 99.8, 100.0, 1.0),
+        ];
+        let r2 = row(&[fday(day, flat)], "0935");
+        assert_eq!(evt(&r2, "1pct_before_minus_1pct_EOD"), Some("neither"));
     }
 }

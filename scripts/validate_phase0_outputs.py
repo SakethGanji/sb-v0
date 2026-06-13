@@ -1419,6 +1419,20 @@ FO_HORIZONS = [
     ("EOD", "eod", 0),
     ("1d", "d", 1), ("2d", "d", 2), ("3d", "d", 3), ("5d", "d", 5),
 ]
+FO_PCT = [("0_5", 0.005), ("1", 0.01), ("2", 0.02), ("3", 0.03), ("5", 0.05), ("10", 0.10), ("20", 0.20)]
+FO_ATR = [("0_25", 0.25), ("0_5", 0.5), ("1", 1.0), ("1_5", 1.5), ("2", 2.0), ("3", 3.0)]
+# (pair name, (up kind,val), (down kind,val), horizon) — the 8 B3 pairs;
+# the 21d pair is B5 (null). stop_first on a same-bar double touch.
+FO_PAIRS = [
+    ("0_5pct_before_minus_0_5pct_30min", ("pct", 0.005), ("pct", 0.005), "30min"),
+    ("1pct_before_minus_1pct_EOD", ("pct", 0.01), ("pct", 0.01), "EOD"),
+    ("2pct_before_minus_1pct_EOD", ("pct", 0.02), ("pct", 0.01), "EOD"),
+    ("3pct_before_minus_1_5pct_EOD", ("pct", 0.03), ("pct", 0.015), "EOD"),
+    ("2pct_before_minus_2pct_1d", ("pct", 0.02), ("pct", 0.02), "1d"),
+    ("3pct_before_minus_3pct_5d", ("pct", 0.03), ("pct", 0.03), "5d"),
+    ("1atr_before_minus_0_5atr_EOD", ("atr", 1.0), ("atr", 0.5), "EOD"),
+    ("2atr_before_minus_1atr_5d", ("atr", 2.0), ("atr", 1.0), "5d"),
+]
 
 
 def corpus_trading_days():
@@ -1467,7 +1481,7 @@ def _fo_adj_rth(daybars, close_t, sym, factor):
     return out
 
 
-def _fo_resolve(per_day_bars, off):
+def _fo_resolve(per_day_bars, off, atr14=None):
     """per_day_bars[k] = adjusted RTH bar list for D+k (k=0..5). Returns a
     dict of recomputed columns for one entry_offset, or None if no entry."""
     d0 = per_day_bars[0]
@@ -1520,6 +1534,7 @@ def _fo_resolve(per_day_bars, off):
     # collapse onto that single bar. Adjudicated: engine is correct.
     entry_bar_min = tape[0][0]
     horizons = {}
+    ends = {}
     for label, kind, k in FO_HORIZONS:
         if kind == "i":
             cap = entry_bar_min + k
@@ -1529,11 +1544,60 @@ def _fo_resolve(per_day_bars, off):
                     end = i
                 else:
                     break
-            horizons[label] = at(end)
         elif kind == "eod":
-            horizons[label] = at(day_end[0])
+            end = day_end[0]
         else:
-            horizons[label] = at(day_end[k])
+            end = day_end[k]
+        ends[label] = end
+        horizons[label] = at(end)
+
+    # --- threshold crossings (mirror engine: high/ep-1>=v up, low/ep-1<=-v
+    # down; 1-based index; 0=never within horizon; None=horizon absent) ---
+    up_pct = {t: None for t, _ in FO_PCT}; dn_pct = {t: None for t, _ in FO_PCT}
+    up_atr = {t: None for t, _ in FO_ATR}; dn_atr = {t: None for t, _ in FO_ATR}
+    have_atr = atr14 is not None and atr14 > 0
+    for i, bb in enumerate(tape):
+        hr = bb[2] / ep - 1.0; lr = bb[3] / ep - 1.0
+        for t, v in FO_PCT:
+            if up_pct[t] is None and hr >= v: up_pct[t] = i
+            if dn_pct[t] is None and lr <= -v: dn_pct[t] = i
+        if have_atr:
+            for t, m in FO_ATR:
+                if up_atr[t] is None and bb[2] >= ep + m*atr14: up_atr[t] = i
+                if dn_atr[t] is None and bb[3] <= ep - m*atr14: dn_atr[t] = i
+    def rep(first, end):
+        if end is None: return None
+        if first is not None and first <= end: return first + 1
+        return 0
+    cross = {}
+    for label, _, _ in FO_HORIZONS:
+        e = ends[label]
+        for t, _ in FO_PCT:
+            cross[f"first_cross_up_{t}pct_{label}"] = rep(up_pct[t], e)
+            cross[f"first_cross_down_{t}pct_{label}"] = rep(dn_pct[t], e)
+        for t, _ in FO_ATR:
+            cross[f"first_cross_up_{t}atr_{label}"] = rep(up_atr[t], e) if have_atr else None
+            cross[f"first_cross_down_{t}atr_{label}"] = rep(dn_atr[t], e) if have_atr else None
+
+    # --- target-before-stop labels (8 pairs) ---
+    labels = {}
+    for name, up, dn, hl in FO_PAIRS:
+        e = ends[hl]
+        upp = ep*(1+up[1]) if up[0] == "pct" else (ep + up[1]*atr14 if have_atr else None)
+        dnp = ep*(1-dn[1]) if dn[0] == "pct" else (ep - dn[1]*atr14 if have_atr else None)
+        if e is None or upp is None or dnp is None:
+            labels[name] = ("no_data", None); continue
+        ua = da = None
+        for i in range(0, e + 1):
+            if ua is None and tape[i][2] >= upp: ua = i
+            if da is None and tape[i][3] <= dnp: da = i
+            if ua is not None and da is not None: break
+        if ua is None and da is None: ev = "neither"
+        elif da is None: ev = "target_first"
+        elif ua is None: ev = "stop_first"
+        elif ua < da: ev = "target_first"
+        else: ev = "stop_first"  # da<ua or same bar (pessimistic)
+        labels[name] = (ev, ev == "target_first")
 
     pre = d0[:eidx]
     pre_vol = sum(b[5] for b in pre)
@@ -1551,6 +1615,8 @@ def _fo_resolve(per_day_bars, off):
         ),
         "entry_open_to_close_1m_return": ebar[4] / ebar[1] - 1.0 if ebar[1] > 0 else None,
         "horizons": horizons,
+        "cross": cross,
+        "labels": labels,
     }
 
 
@@ -1570,13 +1636,14 @@ def forward_outcomes_checks(d):
 
     do = pl.read_parquet(
         OUT / "daily_observation" / f"{d}.parquet",
-        columns=["security_id", "display_symbol_on_day"],
+        columns=["security_id", "display_symbol_on_day", "atr_14d"],
     )
-    sym2sid = {
-        row["display_symbol_on_day"]: row["security_id"]
-        for row in do.iter_rows(named=True)
-        if row["display_symbol_on_day"] in SAMPLE
-    }
+    sym2sid = {}
+    sym2atr = {}
+    for row in do.iter_rows(named=True):
+        if row["display_symbol_on_day"] in SAMPLE:
+            sym2sid[row["display_symbol_on_day"]] = row["security_id"]
+            sym2atr[row["display_symbol_on_day"]] = row["atr_14d"]
     eng = pl.read_parquet(fo_path).filter(
         pl.col("security_id").is_in(list(sym2sid.values()))
     )
@@ -1591,7 +1658,7 @@ def forward_outcomes_checks(d):
     spy_ret = {}
     if "SPY" in sym_bars:
         for off in FO_OFFSETS:
-            res = _fo_resolve(sym_bars["SPY"], off)
+            res = _fo_resolve(sym_bars["SPY"], off, sym2atr.get("SPY"))
             spy_ret[off] = {
                 h: (res["horizons"][h]["ret"] if res and res["horizons"][h] else None)
                 for h, _, _ in FO_HORIZONS
@@ -1600,7 +1667,7 @@ def forward_outcomes_checks(d):
     for sym, sid in sym2sid.items():
         f_d = _fo_factor(sp_all, pin, sym, d)
         for off in FO_OFFSETS:
-            exp = _fo_resolve(sym_bars[sym], off)
+            exp = _fo_resolve(sym_bars[sym], off, sym2atr.get(sym))
             row = eng.filter((pl.col("security_id") == sid) & (pl.col("entry_offset") == off))
             if row.height != 1:
                 r.check(f"{d} {sym}@{off} row present", False, f"rows={row.height}")
@@ -1644,6 +1711,15 @@ def forward_outcomes_checks(d):
                 r.check(f"{tag} ret_{label}_excess_spy",
                         close_enough(row[f"ret_{label}_excess_spy"], want_x),
                         f"eng={row[f'ret_{label}_excess_spy']} indep={want_x}")
+            # threshold crossings (every filled column, all 8 short horizons)
+            for col, want in exp["cross"].items():
+                r.check(f"{tag} {col}", row[col] == want, f"eng={row[col]} indep={want}")
+            # target-before-stop labels (8 B3 pairs): first_event + hit
+            for name, (ev, h_) in exp["labels"].items():
+                r.check(f"{tag} first_event_{name}", row[f"first_event_{name}"] == ev,
+                        f"eng={row[f'first_event_{name}']} indep={ev}")
+                r.check(f"{tag} hit_{name}", row[f"hit_{name}"] == h_,
+                        f"eng={row[f'hit_{name}']} indep={h_}")
 
 
 def forward_property_sweep(days_all):
@@ -1656,6 +1732,8 @@ def forward_property_sweep(days_all):
         "schema drift", "max_runup<0", "max_drawdown>0",
         "ret_EOD outside [dd,runup]", "close_max<close_min",
         "is_halted null when entry present",
+        "B5 horizon crossing not null", "first_event out of domain",
+        "hit != (first_event==target_first)",
     ]}
     grid = {"0935", "0940", "0945", "0950", "0955", "1000", "1005", "1010",
             "1015", "1020", "1030", "1045", "1100", "1130", "1200", "1300", "1530"}
@@ -1692,6 +1770,24 @@ def forward_property_sweep(days_all):
         ).height
         viol["is_halted null when entry present"] += t.filter(
             pl.col("entry_price").is_not_null() & pl.col("is_halted_at_entry").is_null()
+        ).height
+        # B5 horizons (10d+) must stay null in B3-partial; label domain + hit↔event
+        lab = pl.read_parquet(p, columns=[
+            "first_cross_up_1pct_10d", "first_cross_up_1pct_252d",
+            "first_event_1pct_before_minus_1pct_EOD", "hit_1pct_before_minus_1pct_EOD",
+        ])
+        viol["B5 horizon crossing not null"] += lab.filter(
+            pl.col("first_cross_up_1pct_10d").is_not_null()
+            | pl.col("first_cross_up_1pct_252d").is_not_null()
+        ).height
+        ev = "first_event_1pct_before_minus_1pct_EOD"; hh = "hit_1pct_before_minus_1pct_EOD"
+        viol["first_event out of domain"] += lab.filter(
+            pl.col(ev).is_not_null()
+            & ~pl.col(ev).is_in(["target_first", "stop_first", "neither", "no_data"])
+        ).height
+        viol["hit != (first_event==target_first)"] += lab.filter(
+            (pl.col(ev).is_in(["target_first", "stop_first", "neither"]))
+            & (pl.col(hh) != (pl.col(ev) == "target_first"))
         ).height
     for k, n in viol.items():
         r.check(f"fo property: {k}", n == 0, f"violations={n}")
