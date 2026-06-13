@@ -1481,9 +1481,10 @@ def _fo_adj_rth(daybars, close_t, sym, factor):
     return out
 
 
-def _fo_resolve(per_day_bars, off, atr14=None):
+def _fo_resolve(per_day_bars, off, atr14=None, pm_vol=0.0, pm_dollar=0.0):
     """per_day_bars[k] = adjusted RTH bar list for D+k (k=0..5). Returns a
-    dict of recomputed columns for one entry_offset, or None if no entry."""
+    dict of recomputed columns for one entry_offset, or None if no entry.
+    pm_vol/pm_dollar = adjusted premarket volume/dollar for D (04:00-09:30)."""
     d0 = per_day_bars[0]
     if not d0:
         return None
@@ -1695,6 +1696,9 @@ def _fo_resolve(per_day_bars, off, atr14=None):
         "uw": uw,
         "next_day": next_day,
         "gap_rth": gap_rth,
+        # cumulative pre-entry volume: premarket + RTH from open through entry
+        "cum_vol": pm_vol + sum(b[5] for b in d0[:eidx + 1]),
+        "cum_dollar": pm_dollar + sum(b[4] * b[5] for b in d0[:eidx + 1]),
     }
 
 
@@ -1733,6 +1737,19 @@ def forward_outcomes_checks(d):
         ]
         for sym in sym2sid
     }
+    # adjusted premarket (04:00-09:30) volume/dollar for D (cum-volume base);
+    # adj vol = raw/factor, adj dollar = raw_close*raw_vol (factor cancels).
+    d0day = fdays[0]
+    sym_pm = {}
+    for sym in sym2sid:
+        fD = _fo_factor(sp_all, pin, sym, d0day)
+        pmb = daybars[d0day].filter(
+            (pl.col("display_symbol") == sym)
+            & (pl.col("et_time") >= time(4, 0)) & (pl.col("et_time") < time(9, 30))
+        )
+        rv = pmb["volume"].sum() or 0.0
+        rcd = (pmb["close"] * pmb["volume"]).sum() or 0.0
+        sym_pm[sym] = (rv / fD, rcd)
     spy_ret = {}
     if "SPY" in sym_bars:
         for off in FO_OFFSETS:
@@ -1745,7 +1762,8 @@ def forward_outcomes_checks(d):
     for sym, sid in sym2sid.items():
         f_d = _fo_factor(sp_all, pin, sym, d)
         for off in FO_OFFSETS:
-            exp = _fo_resolve(sym_bars[sym], off, sym2atr.get(sym))
+            pmv, pmd = sym_pm[sym]
+            exp = _fo_resolve(sym_bars[sym], off, sym2atr.get(sym), pmv, pmd)
             row = eng.filter((pl.col("security_id") == sid) & (pl.col("entry_offset") == off))
             if row.height != 1:
                 r.check(f"{d} {sym}@{off} row present", False, f"rows={row.height}")
@@ -1836,6 +1854,33 @@ def forward_outcomes_checks(d):
                     col = f"{fam}_day_{k}"
                     r.check(f"{tag} {col}", close_enough(row[col], exp["gap_rth"][k - 1][j]),
                             f"eng={row[col]} indep={exp['gap_rth'][k-1][j]}")
+            # cumulative pre-entry volume
+            r.check(f"{tag} cumulative_volume_to_entry",
+                    close_enough(row["cumulative_volume_to_entry"], exp["cum_vol"]),
+                    f"eng={row['cumulative_volume_to_entry']} indep={exp['cum_vol']}")
+            r.check(f"{tag} cumulative_dollar_volume_to_entry",
+                    close_enough(row["cumulative_dollar_volume_to_entry"], exp["cum_dollar"]),
+                    f"eng={row['cumulative_dollar_volume_to_entry']} indep={exp['cum_dollar']}")
+
+    # cross-sectional pre-entry ranks: full-universe self-consistency — the
+    # rank/percentile columns must equal ranks_desc() of the (sample-validated)
+    # pre_entry source columns, per entry_offset.
+    full = pl.read_parquet(fo_path, columns=[
+        "entry_offset", "pre_entry_ret_from_open", "pre_entry_dollar_volume_from_open",
+        "pre_entry_ret_rank_today", "pre_entry_ret_percentile_today",
+        "pre_entry_dollar_volume_rank_today"])
+    rmm = pmm = dmm = 0
+    for off in full["entry_offset"].unique().to_list():
+        sub = full.filter(pl.col("entry_offset") == off)
+        rk, pc = ranks_desc(sub["pre_entry_ret_from_open"].to_list())
+        dk, _ = ranks_desc(sub["pre_entry_dollar_volume_from_open"].to_list())
+        rmm += sum(1 for a, b in zip(rk, sub["pre_entry_ret_rank_today"].to_list()) if a != b)
+        pmm += sum(1 for a, b in zip(pc, sub["pre_entry_ret_percentile_today"].to_list())
+                   if not close_enough(a, b))
+        dmm += sum(1 for a, b in zip(dk, sub["pre_entry_dollar_volume_rank_today"].to_list()) if a != b)
+    r.check(f"{d} pre_entry_ret_rank_today (full universe)", rmm == 0, f"mismatches={rmm}")
+    r.check(f"{d} pre_entry_ret_percentile_today (full universe)", pmm == 0, f"mismatches={pmm}")
+    r.check(f"{d} pre_entry_dollar_volume_rank_today (full universe)", dmm == 0, f"mismatches={dmm}")
 
 
 def forward_property_sweep(days_all):

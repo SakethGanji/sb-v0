@@ -39,12 +39,12 @@ layer that consumes these tables).
 | B0 engine skeleton + benchmark | ✅ done |
 | B1 `daily_observation` + `market_context_daily` | ✅ complete & L2-validated |
 | B2 `earnings_calendar`, `sector_aggregates_daily`, `security_classification_daily`, `regime_definitions` | ✅ complete & L2-validated |
-| B3 `forward_outcomes` short horizons | 🟡 **core done + L2-validated** (`B3-partial`); remaining families below |
-| B4 `forward_path_short` | ⬜ |
+| B3 `forward_outcomes` short horizons | ✅ **complete & L2-validated** (stamped `B3`) |
+| B4 `forward_path_short` | ⬜ **NEXT** |
 | B5 multi-day horizons + dividends + terminal events | ⬜ |
 | B6 golden-day fixtures + **full 2016–2026 sweep** | ⬜ |
-| Independent validation battery | ✅ 9100/9100 on B1+B2+B3-core |
-| Workspace tests | ✅ 128 passing |
+| Independent validation battery | ✅ 36,415/36,415 on B1+B2+B3 |
+| Workspace tests | ✅ 136 passing |
 | Determinism + resume-equality | ✅ byte-identical (B1/B2) |
 
 **Important:** only **144 days (2016-06-08 → 2016-12-30)** have been swept so
@@ -193,8 +193,10 @@ unit tests share an author with the code they test (correlated blind spots).
 half-day 2016-11-25, post-DST 2016-11-07, dataset-start 2016-06-09) + section
 J (regimes full recompute) + section K (property sweep over all days) +
 **section L (B3 `forward_outcomes`: sample exact recompute × 8 names ×
-{0935,1000,1530} × 8 horizons + a 9-invariant property sweep over all 144
-days).** **9100/9100 pass.**
+{0935,1000,1530} of every family — horizons, crossings, labels, day-0,
+next-day, gap, time-underwater, cumulative volume — plus full-universe rank
+self-consistency and a 12-invariant property sweep over all 144 days).**
+**36,415/36,415 pass.**
 
 **Also:** `scripts/check_determinism.sh` — same day written twice is
 byte-identical, and a cursor-cleared resume reproduces the file byte-for-byte.
@@ -206,7 +208,8 @@ byte-identical, and a cursor-cleared resume reproduces the file byte-for-byte.
 > to ENGINE or VALIDATOR before any further table is built.
 
 This rule was set after B2 shipped without validator coverage; the catch-up
-session (#8) then found 2 more engine bugs. Do not skip it for B3.
+session (#8) then found 2 more engine bugs. Honored through B3 (3 increments,
+each with validator coverage); do not skip it for B4.
 
 ---
 
@@ -275,9 +278,9 @@ announced-but-not-yet-executed future splits) — now excluded-with-warn.
 
 ---
 
-## 9. What's NEXT — B3 and the rest
+## 9. What's NEXT — B4 and the rest
 
-### B3 — `forward_outcomes` short horizons (core DONE, families remaining)
+### B3 — `forward_outcomes` short horizons (✅ DONE)
 
 **Architecture (built):** a **separate forward pass**,
 `bin/write-forward-outcomes`, NOT folded into the chronological sweep (the
@@ -289,33 +292,43 @@ validated `daily_observation[D]`** rather than recomputed, so the pass needs
 no `RollingState`. Forward days need no split rescale (see §6). Run:
 `cargo run --release --bin write-forward-outcomes -- --from … --to …`.
 
-**Core DONE (`B3-partial`, L2-validated, the 8 short horizons
-`10min,30min,60min,EOD,1d,2d,3d,5d`):** identity + entry pricing, all
-pre-entry parametric features, entry-quality / fill-realism proxies,
-per-horizon ret / max_drawdown / max_runup / close-extremes / bars-to-extreme,
-and `ret_<H>_excess_{spy,qqq,iwm}`. Validator §L (sample exact recompute ×
-8 names × {0935,1000,1530}) + property sweep over all 144 days; 4 L1 unit
-tests. Smoke window swept (144 days, ~4s/day).
+**DONE (stamped `B3`, L2-validated) — every short-horizon family for the 8
+horizons `10min,30min,60min,EOD,1d,2d,3d,5d` × 17 offsets:** identity + entry
+pricing, pre-entry parametric features (incl. cross-sectional ranks +
+`cumulative_volume_to_entry`), entry-quality proxies, per-horizon
+ret/drawdown/runup/close-extremes/bars-to-extreme, `ret_<H>_excess_{idx}`,
+fixed-% + ATR threshold crossings (1-based; 0=never; null=truncated),
+`hit_`/`first_event_` target-before-stop labels (8 of 9 pairs; the 21d pair is
+B5), day-0 `ret_to_<seg>` + post-entry session-shape, close-based
+time-underwater, next-day outcomes, and gap-vs-RTH days 1-5. Built across 3
+increments (commits `8958bcd`, `502320a`, + final); 12 L1 tests; validator §L
+recomputes every family for the sample + full-universe rank self-consistency +
+property sweep (incl. B5-horizons-null, label domain, hit↔first_event).
 
-**REMAINING B3 increments (still typed-null on disk now):** threshold
-crossings (fixed-% + ATR), day-0 session segments + session-shape,
-time-underwater, next-day outcomes, gap-vs-RTH days 1-5, `hit_`/`first_event_`
-labels (exact at 1m). Each lands with its validator coverage, then flip the
-milestone stamp `B3-partial`→`B3`. (10d–252d horizons, `ret_<H>_total` +
-dividend flags, `bar_gap_minutes_max`, terminal events are **B5**.)
+**Still null by design (B5):** 10d–252d horizons (ret/dd/runup/crossings/
+excess), `ret_<H>_total` + dividend ex-date flags, `bar_gap_minutes_max` (all
+13 horizons), terminal events, and the `3atr_before_minus_1_5atr_21d` pair.
 
-**Tracer bullet:** the core already writes a month+ of output, so the Phase 1
-§5.1 step-0 vertical slice can fork off now to de-risk the power question.
+**Adjudicated conventions** are documented at the top of
+`forward_outcomes.rs` and §6 above (entry = open of first RTH bar at/after the
+offset; no cross-day rescale; intraday cap from the fill bar; same-bar
+target+stop ⇒ `stop_first`; session-segment boundaries; `time_to_recover` = 0
+when never underwater/never recovered).
 
-**GATE (honored):** the `forward_outcomes` validator section landed in the
-same commit as the engine code; extend it the same way for each remaining
-family.
+**Tracer bullet:** `forward_outcomes` is now complete for the smoke window, so
+the Phase 1 §5.1 step-0 vertical slice can fork off to de-risk the power
+question.
 
-### B4 — `forward_path_short`
+### B4 — `forward_path_short` (NEXT)
 
 23 path checkpoints (1m → 5d_close) long-format, with the +4 v2 Markov-state
 columns (`volatility_within_trade`, `rate_of_change`, `current_ret_over_atr_14d`,
-`halt_gap_crossed`). Schema coded (19 columns).
+`halt_gap_crossed`). Schema coded (19 columns). **Reuses the B3 forward pass:**
+same ~6-day ring buffer + tape; emit one row per `(day, sid, entry_offset,
+checkpoint)` instead of the wide row. The checkpoint set maps onto the same
+tape indices already computed for B3 horizons/crossings, so most of the path
+math is in place — the new work is the long-format writer + the 4 path-state
+columns + validator coverage.
 
 ### B5 — multi-day horizons + dividends + terminal events
 
@@ -371,6 +384,11 @@ Sweep order for a clean full run: `build-earnings-calendar` → `write-phase0`
 ## 11. Commit map (the build history)
 
 ```
+502320a  B3(forward_outcomes): day-0/next-day/gap/time-underwater (increment B)
+8958bcd  B3(forward_outcomes): threshold crossings + target-before-stop labels (A)
+9f43467  B3(forward_outcomes): core short-horizon columns + forward pass + L2
+5cdc863  docs: reconcile RFC/strategy drift (split dates, 657 cols, censor_type)
+775e235  docs: comprehensive Phase 0 build-state & handoff guide
 f4ddc19  validation(#8): full B1+B2 battery — 896/896, 2 engine fixes
 b491a90  validation: determinism + resume-equality script
 4c2c8a7  cleanup: clippy nits

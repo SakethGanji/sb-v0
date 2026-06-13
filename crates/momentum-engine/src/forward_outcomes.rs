@@ -35,6 +35,7 @@
 //!   return is computed (see `ForwardDay::scale`).
 //! - Returns are simple (`p/entry_price - 1`); drawdown ≤ 0, runup ≥ 0.
 
+use crate::daily_observation::ranks_desc;
 use crate::slices::et;
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, DictionaryArray, Float64Array, Int32Array,
@@ -85,6 +86,11 @@ pub struct EntryCtx {
     pub yang_zhang_vol_14d: Option<f64>,
     pub adv_20d: Option<f64>,
     pub addv_20d: Option<f64>,
+    /// Day-D premarket (04:00–09:30 ET) volume / dollar volume, read back
+    /// from `daily_observation[D]` (pin-adjusted) — the 04:00 base for
+    /// `cumulative_volume_to_entry`.
+    pub premarket_volume: Option<f64>,
+    pub premarket_dollar_volume: Option<f64>,
 }
 
 /// One forward day's RTH bars on D's split basis, plus the day's RTH
@@ -183,6 +189,9 @@ struct EntryRow {
     cross: Option<CrossLabels>,
     // day-0 segments/shape, time-underwater, next-day, gap-vs-RTH
     aux: Option<Aux>,
+    // cumulative pre-entry volume (04:00 ET → entry bar inclusive)
+    cum_volume_to_entry: Option<f64>,
+    cum_dollar_volume_to_entry: Option<f64>,
 }
 
 /// Parse an offset label like "0935" or "1530" into ET (hour, minute).
@@ -793,6 +802,34 @@ pub fn build(day: NaiveDate, inputs: &[ForwardInput<'_>]) -> Result<RecordBatch,
         }
     }
 
+    // Cumulative pre-entry volume (04:00 ET → entry bar inclusive).
+    fill.insert("cumulative_volume_to_entry", Arc::new(rows.iter().map(|r| r.cum_volume_to_entry).collect::<Float64Array>()) as ArrayRef);
+    fill.insert("cumulative_dollar_volume_to_entry", Arc::new(rows.iter().map(|r| r.cum_dollar_volume_to_entry).collect::<Float64Array>()) as ArrayRef);
+
+    // Cross-sectional pre-entry ranks — ranked across the universe at each
+    // entry_offset (rank 1 = largest, percentile = (m-1-r0)/m; ranks_desc,
+    // matching daily_observation). Rows are inp-major: index = sec*offsets +
+    // offset_index, so column `p` of offset `oi` is row sec*n_offsets+oi.
+    let mut pe_ret_rank: Vec<Option<i32>> = vec![None; total];
+    let mut pe_ret_pct: Vec<Option<f64>> = vec![None; total];
+    let mut pe_dv_rank: Vec<Option<i32>> = vec![None; total];
+    let n_sec = inputs.len();
+    for oi in 0..n_offsets {
+        let rets: Vec<Option<f64>> = (0..n_sec).map(|s| rows[s * n_offsets + oi].pre_entry_ret_from_open).collect();
+        let dvs: Vec<Option<f64>> = (0..n_sec).map(|s| rows[s * n_offsets + oi].pre_entry_dollar_volume_from_open).collect();
+        let (rr, rp) = ranks_desc(&rets);
+        let (dr, _) = ranks_desc(&dvs);
+        for s in 0..n_sec {
+            let ri = s * n_offsets + oi;
+            pe_ret_rank[ri] = rr[s];
+            pe_ret_pct[ri] = rp[s];
+            pe_dv_rank[ri] = dr[s];
+        }
+    }
+    fill.insert("pre_entry_ret_rank_today", Arc::new(Int32Array::from(pe_ret_rank)) as ArrayRef);
+    fill.insert("pre_entry_ret_percentile_today", Arc::new(Float64Array::from(pe_ret_pct)) as ArrayRef);
+    fill.insert("pre_entry_dollar_volume_rank_today", Arc::new(Int32Array::from(pe_dv_rank)) as ArrayRef);
+
     // Build the batch in schema order; anything not in `fill` is a typed null.
     for field in schema.fields() {
         let a = fill.remove(field.name().as_str()).unwrap_or_else(|| new_null_array(field.data_type(), total));
@@ -863,6 +900,8 @@ fn resolve_entry(
         excess: vec![[None; 3]; SHORT_HORIZONS.len()],
         cross: None,
         aux: None,
+        cum_volume_to_entry: None,
+        cum_dollar_volume_to_entry: None,
     };
     let d0 = match inp.days.first() {
         Some(d) if !d.rth_bars.is_empty() => d,
@@ -898,6 +937,14 @@ fn resolve_entry(
     let loc = (rng > 0.0).then(|| (entry_bar.close - entry_bar.low) / rng);
     let dollar_1m = entry_bar.close * entry_bar.volume;
     let ctx = inp.entry_ctx;
+
+    // ---- cumulative pre-entry volume (04:00 ET → entry bar inclusive) ----
+    // premarket (from daily_observation[D]) + RTH from open through the entry
+    // bar. `pre` is [open, entry) so the entry bar is added explicitly.
+    let cum_volume_to_entry =
+        Some(ctx.premarket_volume.unwrap_or(0.0) + pre_vol + entry_bar.volume);
+    let cum_dollar_volume_to_entry =
+        Some(ctx.premarket_dollar_volume.unwrap_or(0.0) + pre_dollar + dollar_1m);
 
     // ---- horizons + crossings + labels + day-0/next-day/gap families ----
     let (tape, ends) = build_tape_and_ends(inp, eidx);
@@ -954,6 +1001,8 @@ fn resolve_entry(
         excess,
         cross: Some(cross),
         aux: Some(aux),
+        cum_volume_to_entry,
+        cum_dollar_volume_to_entry,
     }
 }
 
@@ -1239,5 +1288,29 @@ mod tests {
         assert!((g[2].unwrap() - (133.1 / 110.0 - 1.0)).abs() < 1e-12); // close-to-close
         assert!((g[3].unwrap() - g[1].unwrap()).abs() < 1e-12); // open_to_close ≡ rth
         assert!((a.next_day[1].unwrap() - (121.0 / 110.0 - 1.0)).abs() < 1e-12); // next_day_gap
+    }
+
+    #[test]
+    fn cumulative_volume_is_premarket_plus_rth_through_entry() {
+        let day = d(2);
+        let bars = vec![
+            b(day, 9, 35, 100.0, 100.0, 100.0, 100.0, 10.0),
+            b(day, 9, 36, 100.0, 100.0, 100.0, 100.0, 20.0),
+        ];
+        let inp = ForwardInput {
+            security_id: "X",
+            display_symbol: "X",
+            days: &[fday(day, bars)],
+            entry_ctx: EntryCtx {
+                premarket_volume: Some(5.0),
+                premarket_dollar_volume: Some(500.0),
+                ..Default::default()
+            },
+            entry_day_factor: 1.0,
+        };
+        // entry at 09:35 (idx0): RTH-through-entry = the entry bar only.
+        let r = resolve_entry(day, &inp, "0935", &Default::default());
+        assert_eq!(r.cum_volume_to_entry, Some(5.0 + 10.0));
+        assert_eq!(r.cum_dollar_volume_to_entry, Some(500.0 + 100.0 * 10.0));
     }
 }

@@ -610,7 +610,7 @@ pub fn build(
 /// largest finite value; percentile = rank-based share of the valid
 /// cross-section strictly below (ties broken by order, documented
 /// approximation). Nulls stay null.
-fn ranks_desc(vals: &[Option<f64>]) -> (Vec<Option<i32>>, Vec<Option<f64>>) {
+pub(crate) fn ranks_desc(vals: &[Option<f64>]) -> (Vec<Option<i32>>, Vec<Option<f64>>) {
     let mut idx: Vec<usize> = (0..vals.len())
         .filter(|&i| vals[i].is_some_and(|v| v.is_finite()))
         .collect();

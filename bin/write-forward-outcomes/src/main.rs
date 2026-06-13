@@ -45,9 +45,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const FWD_TABLE: &str = "forward_outcomes";
-/// Core columns only; later increments fill crossings/segments/labels and
-/// flip this to `B3`, then B5 completes multi-day + terminal events.
-const FWD_MILESTONE: &str = "B3-partial";
+/// All B3 short-horizon families filled (horizons, crossings, labels, day-0,
+/// next-day, gap-vs-RTH, time-underwater, pre-entry ranks, cumulative volume).
+/// B5 completes multi-day horizons + dividend totals + bar_gap + terminal events.
+const FWD_MILESTONE: &str = "B3";
 /// Forward trading days needed to finalize a day's short horizons.
 const FORWARD_DAYS: usize = 5;
 
@@ -142,6 +143,8 @@ fn read_entry_ctx(path: &Path) -> Result<HashMap<String, EntryCtx>> {
         let yz = b.column_by_name("yang_zhang_vol_14d").cloned();
         let adv = b.column_by_name("adv_20d").cloned();
         let addv = b.column_by_name("addv_20d").cloned();
+        let pmv = b.column_by_name("premarket_volume").cloned();
+        let pmdv = b.column_by_name("premarket_dollar_volume").cloned();
         for i in 0..b.num_rows() {
             map.insert(
                 sid.value(i).to_string(),
@@ -150,6 +153,8 @@ fn read_entry_ctx(path: &Path) -> Result<HashMap<String, EntryCtx>> {
                     yang_zhang_vol_14d: yz.as_ref().and_then(|a| optf(a, i)),
                     adv_20d: adv.as_ref().and_then(|a| optf(a, i)),
                     addv_20d: addv.as_ref().and_then(|a| optf(a, i)),
+                    premarket_volume: pmv.as_ref().and_then(|a| optf(a, i)),
+                    premarket_dollar_volume: pmdv.as_ref().and_then(|a| optf(a, i)),
                 },
             );
         }
