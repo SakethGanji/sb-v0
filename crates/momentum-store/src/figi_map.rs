@@ -248,11 +248,22 @@ struct Window {
     display_symbol: String,
 }
 
+/// One window in the reverse (display_symbol → security_id) index. A symbol
+/// can be carried by different securities at different times (ticker reuse),
+/// so the date window disambiguates.
+#[derive(Debug, Clone)]
+struct SymWindow {
+    valid_from: Option<NaiveDate>,
+    valid_to: Option<NaiveDate>,
+    security_id: String,
+}
+
 /// In-memory resolver. Construct via `FigiMap::open` (reads parquet) or
 /// `FigiMap::from_rows` (tests).
 #[derive(Debug, Clone, Default)]
 pub struct FigiMap {
     by_sid: HashMap<String, Vec<Window>>,
+    by_symbol: HashMap<String, Vec<SymWindow>>,
     snapshot_date: Option<NaiveDate>,
 }
 
@@ -263,7 +274,16 @@ impl FigiMap {
 
     pub fn from_rows(rows: Vec<FigiMapRow>) -> Self {
         let mut by_sid: HashMap<String, Vec<Window>> = HashMap::new();
+        let mut by_symbol: HashMap<String, Vec<SymWindow>> = HashMap::new();
         for r in rows {
+            by_symbol
+                .entry(r.display_symbol.clone())
+                .or_default()
+                .push(SymWindow {
+                    valid_from: r.valid_from,
+                    valid_to: r.valid_to,
+                    security_id: r.security_id.clone(),
+                });
             by_sid
                 .entry(r.security_id)
                 .or_default()
@@ -283,6 +303,7 @@ impl FigiMap {
         }
         Self {
             by_sid,
+            by_symbol,
             snapshot_date: None,
         }
     }
@@ -370,6 +391,36 @@ impl FigiMap {
             }
         }
         None
+    }
+
+    /// Reverse lookup: the stable `security_id` (FIGI) that carried
+    /// `symbol` on `day`. `valid_from` inclusive, `valid_to` exclusive.
+    ///
+    /// This is the figi_map-backed backfill for vendor 1m bars that ship a
+    /// NULL `security_id` (the common case — see `bar_reader::day_sessions`):
+    /// it stabilizes a security's identity to its FIGI across a ticker
+    /// rename instead of letting it flip with the display symbol.
+    ///
+    /// Returns `None` when no window covers the day, OR when ≥2 distinct
+    /// security_ids both claim the symbol on that day (ambiguous reuse) —
+    /// the caller then keeps the honest display-symbol fallback rather than
+    /// guess. A single matching window, or several windows agreeing on the
+    /// same sid, resolves cleanly.
+    pub fn resolve_sid(&self, symbol: &str, day: NaiveDate) -> Option<&str> {
+        let windows = self.by_symbol.get(symbol)?;
+        let mut hit: Option<&str> = None;
+        for w in windows {
+            let after_start = w.valid_from.map(|d| day >= d).unwrap_or(true);
+            let before_end = w.valid_to.map(|d| day < d).unwrap_or(true);
+            if after_start && before_end {
+                match hit {
+                    None => hit = Some(w.security_id.as_str()),
+                    Some(prev) if prev == w.security_id => {}
+                    Some(_) => return None, // ambiguous: two sids claim the symbol
+                }
+            }
+        }
+        hit
     }
 
     /// True when a new display symbol became effective for this
@@ -512,6 +563,65 @@ mod tests {
         assert_eq!(m.resolve(&sid, d("2010-01-01")), None);
         // Unknown sid.
         assert_eq!(m.resolve(&SecurityId::new("UNKNOWN"), d("2022-06-09")), None);
+    }
+
+    #[test]
+    fn reverse_resolve_sid_stabilizes_across_rename() {
+        // The crux of the B6 identity fix: a null-bar-sid security keyed by
+        // its display symbol must resolve to the SAME FIGI on both sides of a
+        // rename, so its forward window survives FB -> META.
+        let rows = vec![
+            FigiMapRow {
+                security_id: "BBG000MM2P62".into(),
+                display_symbol: "FB".into(),
+                valid_from: Some(d("2012-05-18")),
+                valid_to: Some(d("2022-06-09")),
+            },
+            FigiMapRow {
+                security_id: "BBG000MM2P62".into(),
+                display_symbol: "META".into(),
+                valid_from: Some(d("2022-06-09")),
+                valid_to: None,
+            },
+        ];
+        let m = FigiMap::from_rows(rows);
+        assert_eq!(m.resolve_sid("FB", d("2022-06-08")), Some("BBG000MM2P62"));
+        assert_eq!(m.resolve_sid("META", d("2022-06-09")), Some("BBG000MM2P62"));
+        // Before the symbol ever existed, and an unknown symbol: no backfill.
+        assert_eq!(m.resolve_sid("FB", d("2010-01-01")), None);
+        assert_eq!(m.resolve_sid("NOPE", d("2022-06-09")), None);
+    }
+
+    #[test]
+    fn reverse_resolve_sid_handles_ticker_reuse_and_ambiguity() {
+        // A ticker freed by one security and reused by another: the date
+        // window disambiguates. Overlapping claims on the same day are
+        // ambiguous -> None (caller keeps the honest symbol fallback).
+        let rows = vec![
+            FigiMapRow {
+                security_id: "BBG_OLD".into(),
+                display_symbol: "XYZ".into(),
+                valid_from: None,
+                valid_to: Some(d("2018-01-01")),
+            },
+            FigiMapRow {
+                security_id: "BBG_NEW".into(),
+                display_symbol: "XYZ".into(),
+                valid_from: Some(d("2020-01-01")),
+                valid_to: None,
+            },
+            // an overlapping-with-NEW window under a different sid
+            FigiMapRow {
+                security_id: "BBG_DUP".into(),
+                display_symbol: "XYZ".into(),
+                valid_from: Some(d("2019-06-01")),
+                valid_to: None,
+            },
+        ];
+        let m = FigiMap::from_rows(rows);
+        assert_eq!(m.resolve_sid("XYZ", d("2017-01-01")), Some("BBG_OLD"));
+        assert_eq!(m.resolve_sid("XYZ", d("2019-01-01")), None); // gap between OLD and the rest
+        assert_eq!(m.resolve_sid("XYZ", d("2021-01-01")), None); // NEW + DUP both claim it
     }
 
     #[test]

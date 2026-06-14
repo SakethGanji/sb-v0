@@ -51,7 +51,7 @@ REL = 1e-9
 
 class Reporter:
     def __init__(self):
-        self.passes = self.fails = 0
+        self.passes = self.fails = self.skips = 0
         self.fail_msgs = []
 
     def check(self, name, ok, detail=""):
@@ -62,6 +62,10 @@ class Reporter:
             self.fails += 1
             self.fail_msgs.append(f"{name}: {detail}")
             print(f"  {R}FAIL{X} {name} {detail}")
+
+    def skip(self, name, detail=""):
+        self.skips += 1
+        print(f"  {Y}SKIP{X} {name} {detail}")
 
 
 r = Reporter()
@@ -88,17 +92,61 @@ def mismatch_count(df, a, b, tol=REL):
 # Raw-tape recomputation primitives
 # ---------------------------------------------------------------------------
 
+_FIGI_MAP_DF = None
+_FIGI_REV_CACHE = {}
+
+
+def _figi_map_df() -> pl.DataFrame:
+    global _FIGI_MAP_DF
+    if _FIGI_MAP_DF is None:
+        _FIGI_MAP_DF = pl.read_parquet(
+            REF / "figi_map.parquet",
+            columns=["security_id", "display_symbol", "valid_from", "valid_to"],
+        )
+    return _FIGI_MAP_DF
+
+
+def _figi_rev_for_day(d: date) -> dict:
+    """Independent reimplementation of FigiMap::resolve_sid: display_symbol ->
+    stable FIGI for symbols whose figi_map window covers d. Drops symbols with
+    >=2 distinct sids covering the same day (ambiguous ticker reuse) so the
+    caller keeps the honest symbol fallback — mirrors the engine exactly."""
+    if d not in _FIGI_REV_CACHE:
+        fm = _figi_map_df()
+        cov = fm.filter(
+            (pl.col("valid_from").is_null() | (pl.col("valid_from") <= d))
+            & (pl.col("valid_to").is_null() | (pl.col("valid_to") > d))
+        )
+        g = cov.group_by("display_symbol").agg(
+            pl.col("security_id").n_unique().alias("n"),
+            pl.col("security_id").first().alias("sid"),
+        )
+        _FIGI_REV_CACHE[d] = {
+            r["display_symbol"]: r["sid"]
+            for r in g.iter_rows(named=True) if r["n"] == 1
+        }
+    return _FIGI_REV_CACHE[d]
+
+
 def load_day_bars(d: date) -> pl.DataFrame:
     df = pl.read_parquet(BARS / f"{d}.parquet")
+    df = df.with_columns(
+        pl.col("t").dt.convert_time_zone("America/New_York").dt.time().alias("et_time"),
+        pl.col("t").dt.convert_time_zone("America/New_York").dt.date().alias("et_date"),
+    ).filter(pl.col("et_date") == d)  # session membership = ET date (adjudicated)
+    # sid_key mirrors the engine identity: real bar sid, else the figi_map
+    # FIGI backfilled by (display_symbol, day), else the honest symbol fallback.
+    rev = _figi_rev_for_day(d)
+    rev_df = pl.DataFrame(
+        {"display_symbol": list(rev.keys()), "_figi": list(rev.values())},
+        schema={"display_symbol": pl.Utf8, "_figi": pl.Utf8},
+    )
     return (
-        df.with_columns(
-            pl.col("t").dt.convert_time_zone("America/New_York").dt.time().alias("et_time"),
-            pl.col("t").dt.convert_time_zone("America/New_York").dt.date().alias("et_date"),
-        )
-        .filter(pl.col("et_date") == d)  # session membership = ET date (adjudicated)
+        df.join(rev_df, on="display_symbol", how="left")
         .with_columns(
-            pl.coalesce(pl.col("security_id"), pl.col("display_symbol")).alias("sid_key")
+            pl.coalesce(pl.col("security_id"), pl.col("_figi"), pl.col("display_symbol")).alias("sid_key")
         )
+        .drop("_figi")
     )
 
 
@@ -2445,12 +2493,222 @@ def forward_path_property_sweep(days_all):
 
 
 # ---------------------------------------------------------------------------
+# N. golden days (B6) — hand-verified corporate-action stress cases the
+# 2016-H2 smoke window never exercises. Read from a SEPARATE output tree
+# (golden_days.GOLDEN_OUT) so they don't perturb the smoke battery's
+# cross-day cumulative state. Each assertion is anchored to external truth
+# frozen in golden_days.py, independent of the engine's adjustment code.
+# ---------------------------------------------------------------------------
+
+def _raw_entry_open(sym, d, offset, factor):
+    """Pin-adjusted open of the entry bar = first RTH bar at minute >= offset
+    (mirrors the engine: the offset minute, or the next available bar when it
+    is absent — e.g. a halt). Returns (adj_open, entry_et) or None."""
+    off_min = int(offset[:2]) * 60 + int(offset[2:])
+    bars = load_day_bars(d)
+    close_t = spy_session_close(bars)
+    b = bars.filter(
+        (pl.col("display_symbol") == sym)
+        & (pl.col("et_time") >= time(9, 30)) & (pl.col("et_time") <= close_t)
+    ).sort("t")
+    for row in b.iter_rows(named=True):
+        et = row["et_time"]
+        if et.hour * 60 + et.minute >= off_min:
+            return row["open"] * factor, et
+    return None
+
+
+def _golden_fo_row(out_dir, entry_date, sid, offset):
+    """The engine forward_outcomes row for (sid, offset) on entry_date in the
+    golden output tree. Returns the dict, None (day not swept), or False
+    (swept but the row is absent)."""
+    p = out_dir / "forward_outcomes" / f"{entry_date}.parquet"
+    if not p.exists():
+        return None
+    rw = pl.read_parquet(p).filter(
+        (pl.col("security_id") == sid) & (pl.col("entry_offset") == offset))
+    return rw.to_dicts()[0] if rw.height == 1 else False
+
+
+def golden_checks():
+    try:
+        import golden_days as gd
+    except ImportError:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import golden_days as gd
+
+    out_dir = ROOT / gd.GOLDEN_OUT
+    corpus = corpus_trading_days()
+    sp_all, pin = _fo_splits()
+    print(f"\n{'='*64}\nN. golden days (B6)  [tree: {gd.GOLDEN_OUT}]")
+    if not out_dir.exists():
+        r.skip("golden tree not swept yet",
+               f"run golden_days.SWEEP_RECIPE then re-run with --golden ({gd.GOLDEN_OUT} absent)")
+        return
+
+    for spec in gd.GOLDEN_DAYS:
+        name, et, sid = spec["name"], spec["entry_date"], spec["security_id"]
+        off, sym = spec["entry_offset"], spec["symbol"]
+        kind = spec["event_type"]
+        a = spec["anchor"]
+
+        # rename resolves identity by symbol-on-day (the security_id is not
+        # stable across the rename — that is the finding), so it does its own
+        # row lookup below rather than the generic FIGI-keyed fetch.
+        if kind != "rename":
+            if not (out_dir / "forward_outcomes" / f"{et}.parquet").exists():
+                r.skip(f"{name}", f"entry day {et} not swept into {gd.GOLDEN_OUT}")
+                continue
+            row = _golden_fo_row(out_dir, et, sid, off)
+            if row is False:
+                r.check(f"{name} row present", False, f"{sym}/{sid}@{off} on {et}")
+                continue
+
+        if kind == "split":
+            # external anchor: the split really is 4:1 in the reference data.
+            srow = sp_all.filter(
+                (pl.col("display_symbol") == sym)
+                & (pl.col("execution_date") == spec["event_date"]))
+            ratio = (srow["split_to"][0] / srow["split_from"][0]) if srow.height else None
+            r.check(f"{name} split ratio == 4 (external)", ratio == a["ratio"], f"={ratio}")
+            # independent recompute on a consistent pin basis (factor cancels
+            # nothing across the split boundary — D and D+1 carry different
+            # per-day factors; the engine must reconcile them).
+            f_e = _fo_factor(sp_all, pin, sym, et)
+            eo = _raw_entry_open(sym, et, off, f_e)
+            d1 = corpus[corpus.index(et) + 1]
+            md = _md_daily(d1, {sym})
+            if eo and sym in md:
+                ep_indep = eo[0]
+                ret1_indep = md[sym][0] / ep_indep - 1.0
+                r.check(f"{name} entry_price (indep pin-adj)",
+                        close_enough(row["entry_price"], ep_indep, 1e-6),
+                        f"eng={row['entry_price']} indep={ep_indep:.4f}")
+                r.check(f"{name} ret_1d == indep recompute",
+                        row["ret_1d"] is not None and close_enough(row["ret_1d"], ret1_indep, 1e-6),
+                        f"eng={row['ret_1d']} indep={ret1_indep:+.4f}")
+                # sanity band: a consistent basis gives ~+3%; a cross-basis read
+                # gives ~-74%, a double-adjust ~+3x. Catch all three.
+                r.check(f"{name} ret_1d sane (|.|<0.15, not {a['naive_raw_ret_1d']})",
+                        row["ret_1d"] is not None and abs(row["ret_1d"]) < 0.15,
+                        f"eng={row['ret_1d']}")
+            else:
+                r.skip(f"{name} recompute", "entry/forward bar unavailable")
+
+        elif kind == "dividend":
+            md_div = dict(_md_dividends(sym))  # ex_date -> pin-adjusted cash
+            ex = spec["event_date"]
+            div_adj = md_div.get(ex)
+            r.check(f"{name} dividend in tape (~{a['split_adjusted_cash_amount']})",
+                    div_adj is not None and close_enough(div_adj, a["split_adjusted_cash_amount"], 1e-3),
+                    f"indep={div_adj}")
+            r.check(f"{name} dividend_ex_date_within_1d flag",
+                    row.get("dividend_ex_date_within_1d") is True,
+                    f"={row.get('dividend_ex_date_within_1d')}")
+            ep, rp, rt = row["entry_price"], row["ret_1d"], row.get("ret_1d_total")
+            if None not in (ep, rp, rt) and div_adj is not None and ep > 0:
+                r.check(f"{name} ret_total - ret_price == div/entry",
+                        close_enough(rt - rp, div_adj / ep, 1e-6),
+                        f"eng_gap={rt-rp:.6f} indep={div_adj/ep:.6f}")
+            else:
+                r.skip(f"{name} total-vs-price gap", "null ret_total/ret_1d/entry_price")
+
+        elif kind == "delisting":
+            r.check(f"{name} terminal_event_type",
+                    row["terminal_event_type"] == a["terminal_event_type"],
+                    f"={row['terminal_event_type']}")
+            r.check(f"{name} terminal_event_date == vendor delist",
+                    row["terminal_event_date"] == spec["event_date"],
+                    f"eng={row['terminal_event_date']} anchor={spec['event_date']}")
+            r.check(f"{name} terminal_event_confidence",
+                    row["terminal_event_confidence"] == a["terminal_event_confidence"],
+                    f"={row['terminal_event_confidence']}")
+
+        elif kind == "halt":
+            r.check(f"{name} is_halted_at_entry",
+                    row["is_halted_at_entry"] is True,
+                    f"={row['is_halted_at_entry']}")
+            # entry must fill at the resumption bar, not the (absent) offset minute.
+            f_e = _fo_factor(sp_all, pin, sym, et)
+            eo = _raw_entry_open(sym, et, off, f_e)
+            if eo:
+                resume = eo[1].strftime("%H:%M")
+                r.check(f"{name} entry fills at resume {a['resume_et']}",
+                        resume == a["resume_et"], f"entry_et={resume}")
+                r.check(f"{name} entry_price == resume-bar open",
+                        close_enough(row["entry_price"], eo[0], 1e-6),
+                        f"eng={row['entry_price']} indep={eo[0]:.4f}")
+            else:
+                r.skip(f"{name} resume bar", "no RTH bar at/after offset")
+
+        elif kind == "rename":
+            # forward_outcomes has no display_symbol column — identity is the
+            # security_id alone; the symbol lives in daily_observation. Resolve
+            # the OLD-symbol row by symbol on the entry day, then ask whether the
+            # forward window survives the rename.
+            #
+            # KNOWN B6 FINDING (2026-06-14): the vendor 1m bars carry a null
+            # security_id for ~55% of symbols (incl. FB pre-rename); the engine
+            # falls back to the DISPLAY SYMBOL as security_id and does NOT
+            # backfill the stable FIGI from figi_map. So a security renamed
+            # mid-window flips identity (FB -> BBG000MM2P62) exactly at the
+            # rename, and the FIGI-keyed forward matrix can't match the
+            # symbol-keyed entry: multi-day forward returns are NULL (honest,
+            # not fabricated). These checks assert the DESIRED continuity and
+            # therefore FAIL until the identity model is reconciled — they mark
+            # the open gap rather than paper over it.
+            if not (out_dir / "daily_observation" / f"{et}.parquet").exists():
+                r.skip(f"{name}", f"entry day {et} not swept into {gd.GOLDEN_OUT}")
+                continue
+            do_entry = pl.read_parquet(
+                out_dir / "daily_observation" / f"{et}.parquet",
+                columns=["security_id", "display_symbol_on_day"])
+            old = do_entry.filter(pl.col("display_symbol_on_day") == a["old_symbol"])
+            entry_sid = old["security_id"][0] if old.height == 1 else None
+            row = _golden_fo_row(out_dir, et, entry_sid, off) if entry_sid else False
+            do_new = pl.read_parquet(
+                out_dir / "daily_observation" / f"{spec['companion_entry']}.parquet",
+                columns=["security_id", "display_symbol_on_day"])
+            new = do_new.filter(pl.col("display_symbol_on_day") == a["new_symbol"])
+            new_sid = new["security_id"][0] if new.height == 1 else None
+
+            r.check(f"{name} security_id stable across rename "
+                    f"(entry={entry_sid} -> new={new_sid})",
+                    entry_sid is not None and entry_sid == new_sid,
+                    "FIGI backfilled from figi_map for the null-bar-sid old symbol")
+            if row in (None, False):
+                r.check(f"{name} entry row present under {entry_sid}", row not in (None, False), "")
+            else:
+                r.check(f"{name} ret_1d continuous across rename (non-null)",
+                        row["ret_1d"] is not None,
+                        f"ret_1d={row['ret_1d']} (forward bars under the post-rename FIGI resolve)")
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
 def main():
+    argv = sys.argv[1:]
+    run_golden = "--golden" in argv
+    golden_only = run_golden and len(argv) == 1
+    day_args = [a for a in argv if not a.startswith("--")]
+
+    # --golden alone: fast focused golden run, skip the smoke battery.
+    if golden_only:
+        golden_checks()
+        print(f"\n{'='*64}")
+        print(f"PASSED: {G}{r.passes}{X}   FAILED: {R}{r.fails}{X}   SKIPPED: {Y}{r.skips}{X}")
+        if r.fail_msgs:
+            print(f"{R}Failures:{X}")
+            for m in r.fail_msgs:
+                print(f"  - {m}")
+            sys.exit(1)
+        print(f"{G}ALL GOLDEN CHECKS PASS{X}" if r.passes else f"{Y}NO GOLDEN OUTPUTS YET{X}")
+        return
+
     days_all = all_trading_days()
-    battery = ([date.fromisoformat(a) for a in sys.argv[1:]]
+    battery = ([date.fromisoformat(a) for a in day_args]
                or [date(2016, 12, 30), date(2016, 11, 25), date(2016, 11, 7), date(2016, 6, 9)])
     battery = [d for d in battery if d in set(days_all)]
     print(f"battery days: {battery} | swept days: {len(days_all)}")
@@ -2501,9 +2759,11 @@ def main():
     property_sweep(days_all)
     forward_property_sweep(days_all)
     forward_path_property_sweep(days_all)
+    if run_golden:
+        golden_checks()
 
     print(f"\n{'='*64}")
-    print(f"PASSED: {G}{r.passes}{X}   FAILED: {R}{r.fails}{X}")
+    print(f"PASSED: {G}{r.passes}{X}   FAILED: {R}{r.fails}{X}   SKIPPED: {Y}{r.skips}{X}")
     if r.fail_msgs:
         print(f"{R}Failures:{X}")
         for m in r.fail_msgs:

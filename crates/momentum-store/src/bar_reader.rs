@@ -225,6 +225,17 @@ impl MaterializedBarReader {
         self.figi_map.resolve(sid, day).unwrap_or(sid.as_str())
     }
 
+    /// Stable security_id for a bar whose vendor `security_id` is NULL (the
+    /// common case — ~55% of symbols/day). Backfills the FIGI from the
+    /// figi_map by (display_symbol, day) so a renamed security keeps ONE
+    /// identity across the rename; falls back to the display symbol when the
+    /// figi_map has no unambiguous coverage (the ~21% missing FIGIs, plus
+    /// ambiguous ticker reuse). Public so the forward pass keys its
+    /// reference lookups (dividends) on the same identity.
+    pub fn resolve_null_sid<'a>(&'a self, symbol: &'a str, day: NaiveDate) -> &'a str {
+        self.figi_map.resolve_sid(symbol, day).unwrap_or(symbol)
+    }
+
     fn day_path(&self, day: NaiveDate) -> PathBuf {
         self.bars_dir.join(format!("{day}.parquet"))
     }
@@ -361,9 +372,16 @@ impl MaterializedBarReader {
                     continue;
                 }
                 let symbol = symbols.value(i);
-                let sid = if sids.is_null(i) { symbol } else { sids.value(i) };
+                // Null vendor sid: backfill the stable FIGI from figi_map so a
+                // renamed security keeps one identity (build-state B6 fix);
+                // honest symbol fallback when no unambiguous FIGI exists.
+                let sid: String = if sids.is_null(i) {
+                    self.resolve_null_sid(symbol, day).to_string()
+                } else {
+                    sids.value(i).to_string()
+                };
                 by_key
-                    .entry((symbol.to_string(), sid.to_string()))
+                    .entry((symbol.to_string(), sid))
                     .or_default()
                     .push(Bar {
                         t: dt,

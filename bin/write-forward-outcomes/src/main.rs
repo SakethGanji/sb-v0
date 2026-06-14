@@ -249,7 +249,16 @@ fn build_dividend_lookup(
             }
             let exd = epoch + chrono::Duration::days(ex.value(i) as i64);
             let symbol = if sym.is_null(i) { "" } else { sym.value(i) };
-            let key = if sid.is_null(i) { symbol.to_string() } else { sid.value(i).to_string() };
+            // Match the FIGI-stabilized entry identity (build-state B6): a
+            // renamed security's old-symbol dividend rows carry a null sid
+            // (dividends.parquet is keyed by current symbol), so resolve the
+            // stable FIGI by (symbol, ex_date) — else the entry, now keyed by
+            // FIGI, would miss its pre-rename dividends.
+            let key = if sid.is_null(i) {
+                reader.resolve_null_sid(symbol, exd).to_string()
+            } else {
+                sid.value(i).to_string()
+            };
             let f = reader.adjustment_factor(&SecurityId::new(&key), symbol, exd);
             m.entry(key).or_default().push((exd, amt.value(i) * f));
         }

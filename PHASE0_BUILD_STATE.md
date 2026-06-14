@@ -42,9 +42,10 @@ layer that consumes these tables).
 | B3 `forward_outcomes` short horizons | ✅ **complete & L2-validated** (stamped `B5`) |
 | B4 `forward_path_short` | ✅ **complete & L2-validated** (stamped `B4`) |
 | B5 multi-day horizons + dividends + terminal events | ✅ **complete** — `forward_outcomes` at all 657 cols |
-| B6 golden-day fixtures + **full 2016–2026 sweep** | ⬜ **NEXT** |
-| Independent validation battery | ✅ 85,552/85,552 on B1+B2+B3+B4+B5 |
-| Workspace tests | ✅ 137 passing |
+| B6a golden-day fixtures (split / ex-div / delisting / LULD halt / rename) | ✅ **complete & L2-validated** — `scripts/golden_days.py` + validator §N, 15/15 |
+| B6b **full 2016–2026 sweep** | ⬜ **NEXT** (the remaining B6 work) |
+| Independent validation battery | ✅ 85,553/85,553 on B1+B2+B3+B4+B5 + 15/15 golden |
+| Workspace tests | ✅ 139 passing |
 | Determinism + resume-equality | ✅ byte-identical (B1/B2) |
 
 **Important:** only **144 days (2016-06-08 → 2016-12-30)** have been swept so
@@ -231,6 +232,21 @@ re-adjudicating** — the validator encodes them deliberately:
   after-hours bars carry the next UTC date — comparing UTC silently dropped them).
 - **Split factors are sid-first, symbol-fallback** (old-symbol splits only
   aggregate under the FIGI; correct for renamed tickers).
+- **(B6a) Security identity is stabilized to the FIGI.** ~55% of symbols/day
+  ship a NULL `security_id` in the vendor 1m bars; `day_sessions` now backfills
+  the stable FIGI from `figi_map` by `(display_symbol, day)`
+  (`FigiMap::resolve_sid`), falling back to the display symbol only when the
+  map has no unambiguous coverage (~21% missing FIGI, plus ambiguous ticker
+  reuse → honest symbol fallback). **Why it matters:** before this, a renamed
+  security flipped identity at the rename (e.g. `FB`→`BBG000MM2P62` on
+  2022-06-09), so the FIGI-keyed forward matrix could not match the
+  symbol-keyed pre-rename entry and **all multi-day forward returns for the
+  ~year before the rename went null** — bounded to ~2,664 in-corpus renames,
+  invisible in the calm smoke window. Found by the B6 rename golden day; fixed
+  engine-wide (one site stabilizes both `daily_observation` and the forward
+  matrix). The forward dividend lookup keys through the same resolution so a
+  renamed security's pre-rename dividends still attach. Smoke window re-swept;
+  85,553/85,553 still pass.
 - **All volume columns are on the pin-adjusted basis** (uniform).
 - **`.TEST` / premarket-only securities belong in the universe** (record
   everything; no filtering).
@@ -383,14 +399,34 @@ Validator §L5 + a delisting-security terminal check. `forward_outcomes` is now
 complete at **all 657 columns** (only honest nulls remain: `bar_gap` 10d+ and
 the terminal-detail columns for non-delisting names).
 
-### B6 — golden days + full sweep (NEXT)
+### B6a — golden days (DONE)
 
-Hand-verified fixtures (AAPL 2020-08-31 split, FB→META 2022-06-09 rename,
-an ex-div, a LULD halt, a delisting), then the **full 2016–2026 sweep** (all
-8 tables). Note: the forward pass needs reading ~252 days past `to` for the
-daily matrix; for the full run, source the daily matrix from
+Five hand-verified fixtures in `scripts/golden_days.py`, each grounded in real
+reference data + the raw tape, validated by `validate_phase0_outputs.py §N`
+(run `… --golden`; sweep recipe in `golden_days.SWEEP_RECIPE` → a separate
+`data/outputs_golden/` tree so they never perturb the smoke battery):
+
+| Fixture | Entry | Validates |
+|---|---|---|
+| AAPL 4:1 split | 2020-08-28 | straddle return on one consistent pin basis (+2.8%, not −74% / not double-adjusted) |
+| AAPL ex-div | 2020-08-06 | `ret_total − ret_price == div/entry`; `within_1d` flag |
+| LOGM delisting | 2020-08-28 | `delisted_unknown` dated to the vendor delist, no fabricated reason |
+| 2020-03-09 LULD halt | 0935 entry | `is_halted_at_entry`, fills at the 09:49 resumption bar |
+| FB→META rename | 2022-06-08 | FIGI identity stable across rename; forward window continuous |
+
+**15/15 PASS.** The rename day surfaced + drove the B6a identity-stabilization
+fix (see §6: null bar-sid → FIGI backfill). Result: 4 corporate-action types
+were already correct on real 2020 stress data; the 5th exposed a real gap, now
+fixed.
+
+### B6b — full 2016–2026 sweep (NEXT)
+
+The **full 2,513-day sweep** (all 8 tables). The forward pass reads ~252 days
+past `to` for the daily matrix; for the full run, source the daily matrix from
 `daily_observation` (corpus-wide) rather than re-reading raw bars. Re-run
 `build-regimes` afterward so thresholds reflect the true exploration window.
+Re-run the full validation battery on stress regimes (a halt day, the rename
+day, the split day, a 2020 COVID week) to close the smoke-window coverage gap.
 
 ---
 

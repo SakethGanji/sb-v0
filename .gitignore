@@ -11,6 +11,10 @@ Cargo.lock.bak
 # Cache root (per README §5.4)
 data/
 
+# Python (validation scripts)
+__pycache__/
+*.pyc
+
 # IDE
 .idea/
 .vscode/
