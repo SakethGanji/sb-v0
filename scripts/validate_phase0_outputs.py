@@ -1916,6 +1916,7 @@ def forward_property_sweep(days_all):
         "terminal_event_type out of domain", "first_event out of domain",
         "hit != (first_event==target_first)",
         "bar_gap 10d+ not null", "ret_252d outside [dd,runup]",
+        "collided sid entry not null",
     ]}
     grid = {"0935", "0940", "0945", "0950", "0955", "1000", "1005", "1010",
             "1015", "1020", "1030", "1045", "1100", "1130", "1200", "1300", "1530"}
@@ -1964,6 +1965,13 @@ def forward_property_sweep(days_all):
             pl.col("ret_252d").is_not_null()
             & ((pl.col("ret_252d") < pl.col("max_drawdown_252d") - 1e-9)
                | (pl.col("ret_252d") > pl.col("max_runup_252d") + 1e-9))).height
+        # vendor sid collisions → null forward outcomes (build-state §6)
+        do_sids = pl.read_parquet(OUT / "daily_observation" / f"{d}.parquet", columns=["security_id"])
+        coll = do_sids.group_by("security_id").len().filter(pl.col("len") > 1)["security_id"].to_list()
+        if coll:
+            ep_coll = pl.read_parquet(p, columns=["security_id", "entry_price"]).filter(
+                pl.col("security_id").is_in(coll))
+            viol["collided sid entry not null"] += ep_coll.filter(pl.col("entry_price").is_not_null()).height
         # label domain + hit↔event; terminal_event_type domain (B5b)
         lab = pl.read_parquet(p, columns=[
             "terminal_event_type",

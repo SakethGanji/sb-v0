@@ -223,6 +223,9 @@ pub fn build(day: NaiveDate, inputs: &[ForwardInput<'_>]) -> Result<RecordBatch,
     let mut rows: Vec<CpRow> = Vec::new();
 
     for inp in inputs {
+        if inp.ambiguous {
+            continue; // collided sid — no path rows (honest ambiguity)
+        }
         let d0 = match inp.days.first() {
             Some(d) if !d.rth_bars.is_empty() => d,
             _ => continue,

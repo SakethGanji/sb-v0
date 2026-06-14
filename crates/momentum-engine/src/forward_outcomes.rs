@@ -145,6 +145,12 @@ pub struct ForwardInput<'a> {
     /// the bin (needs the delisting lookup + calendar); the engine just emits
     /// it and derives `terminal_event_return` per entry price.
     pub terminal: TerminalInfo,
+    /// Vendor sid collision: this composite FIGI appears under two display
+    /// symbols on day D (two distinct securities). Forward tracking can't
+    /// attribute bars to either listing, so ALL outcome columns are emitted
+    /// null — honest ambiguity, matching `daily_observation`'s purged trailing
+    /// state for collided sids (build-state §6). The row is still emitted.
+    pub ambiguous: bool,
 }
 
 /// (B5b) Per-(security, day D) terminal-event info. `event_type` is `"none"`
@@ -1044,6 +1050,9 @@ fn resolve_entry(
         terminal: TerminalInfo::default(),
         terminal_return: None,
     };
+    if inp.ambiguous {
+        return blank(); // collided sid — honestly null for both listings
+    }
     let d0 = match inp.days.first() {
         Some(d) if !d.rth_bars.is_empty() => d,
         _ => return blank(),
@@ -1468,6 +1477,7 @@ mod tests {
             forward_daily: &[],
             dividends_fwd: &[],
             terminal: Default::default(),
+            ambiguous: false,
         };
         resolve_entry(days[0].day, &inp, off, &Default::default())
     }
@@ -1594,6 +1604,7 @@ mod tests {
             forward_daily: &[],
             dividends_fwd: &[],
             terminal: Default::default(),
+            ambiguous: false,
         };
         let r = resolve_entry(day, &inp, "0935", &Default::default());
         assert_eq!(cross_atr(&r, "EOD", "1", false), Some(3));
@@ -1708,6 +1719,7 @@ mod tests {
             forward_daily: &[],
             dividends_fwd: &[],
             terminal: Default::default(),
+            ambiguous: false,
         };
         // entry at 09:35 (idx0): RTH-through-entry = the entry bar only.
         let r = resolve_entry(day, &inp, "0935", &Default::default());

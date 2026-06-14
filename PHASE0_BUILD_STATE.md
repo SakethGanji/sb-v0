@@ -238,6 +238,10 @@ re-adjudicating** — the validator encodes them deliberately:
   GOLD/AMRK, COMM/VISN): rows are kept, but the sid is **permanently
   ambiguous** once detected — its rolling trailing state is purged and never
   accumulates again, so trailing columns stay honestly null for both listings.
+  **(B5) `forward_outcomes` nulls ALL outcome columns for collided sids and
+  `forward_path_short` emits no rows** (forward bars can't be attributed to
+  either listing) — same honest-ambiguity principle. Caught by the B5 E2E:
+  the daily matrix kept one listing while the 1m tape kept the other.
 - **Rolling "prior day" = last TRADED day**, not strictly D-1 (gappy names).
 - **market_context count columns are null-when-zero-valid.**
 - **(B3) forward windows need NO cross-day split rescale.** `day_sessions`

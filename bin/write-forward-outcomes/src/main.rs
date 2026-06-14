@@ -362,6 +362,13 @@ fn emit_day(
     let ctx_path = out.join("daily_observation").join(format!("{day}.parquet"));
     let ctx_map = read_entry_ctx(&ctx_path).unwrap_or_default();
 
+    // Vendor sid collisions on day D: one composite FIGI under ≥2 display
+    // symbols. Their forward outcomes are emitted null (build-state §6).
+    let mut sid_counts: HashMap<&str, u32> = HashMap::new();
+    for s in &d0.sessions {
+        *sid_counts.entry(s.security_id.as_str()).or_default() += 1;
+    }
+
     let owned: Vec<Vec<ForwardDay>> = d0
         .sessions
         .iter()
@@ -382,6 +389,7 @@ fn emit_day(
                 forward_daily: fwd_daily(matrix, sid, day),
                 dividends_fwd: fwd_div(div, sid, day),
                 terminal: compute_terminal(sid, day, delisted, matrix, all_days, matrix_end),
+                ambiguous: sid_counts.get(sid).copied().unwrap_or(0) > 1,
             }
         })
         .collect();
