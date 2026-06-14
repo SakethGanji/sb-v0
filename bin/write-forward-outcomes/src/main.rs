@@ -32,8 +32,9 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, Utc};
 use momentum_calendar::Calendar;
 use momentum_core::phase0_outputs::{forward_outcomes_schema, forward_path_short_schema};
+use momentum_core::ids::SecurityId;
 use momentum_engine::cursor::EngineCursor;
-use momentum_engine::forward_outcomes::{self, EntryCtx, ForwardDay, ForwardInput};
+use momentum_engine::forward_outcomes::{self, DailyBar, EntryCtx, ForwardDay, ForwardInput};
 use momentum_engine::forward_path;
 use momentum_engine::stamps;
 use momentum_store::bar_reader::{DaySession, MaterializedBarReader};
@@ -47,11 +48,10 @@ use std::time::Instant;
 
 const FWD_TABLE: &str = "forward_outcomes";
 const FWD_PATH_TABLE: &str = "forward_path_short";
-/// All B3 short-horizon families filled (horizons, crossings, labels, day-0,
-/// next-day, gap-vs-RTH, time-underwater, pre-entry ranks, cumulative volume).
-/// B4 adds `forward_path_short` (long-format checkpoints) in the same pass.
-/// B5 completes multi-day horizons + dividend totals + bar_gap + terminal events.
-const FWD_MILESTONE: &str = "B3";
+/// B3 short-horizon families + B5a multi-day horizon stats (10d–252d),
+/// ret_<H>_total, dividend flags, bar_gap. B5b (daily crossings for 10d+,
+/// the 21d label pair, terminal events) flips this to `B5`.
+const FWD_MILESTONE: &str = "B5-partial";
 const FP_MILESTONE: &str = "B4";
 /// Forward trading days needed to finalize a day's short horizons.
 const FORWARD_DAYS: usize = 5;
@@ -197,6 +197,84 @@ fn build_fdays(sid: &str, buf: &VecDeque<BufferedDay>) -> Vec<ForwardDay> {
     fdays
 }
 
+/// (B5) Pin-adjusted daily RTH (close, high, low) per security over `days`,
+/// for the multi-day horizons. Sparse (one entry per TRADED day, sorted by
+/// day); a vendor sid collision keeps only the first session that day.
+fn build_daily_matrix(
+    reader: &MaterializedBarReader,
+    calendar: &Calendar,
+    days: &[NaiveDate],
+) -> Result<HashMap<String, Vec<DailyBar>>> {
+    let mut m: HashMap<String, Vec<DailyBar>> = HashMap::new();
+    for &day in days {
+        let sessions = reader.day_sessions(day)?;
+        let close_t = calendar.session_close(day)?;
+        for s in &sessions {
+            let fd = ForwardDay::from_session(day, &s.session.bars, close_t);
+            if fd.rth_bars.is_empty() {
+                continue;
+            }
+            let hi = fd.rth_bars.iter().map(|b| b.high).fold(f64::MIN, f64::max);
+            let lo = fd.rth_bars.iter().map(|b| b.low).fold(f64::MAX, f64::min);
+            let c = fd.rth_bars.last().unwrap().close;
+            let v = m.entry(s.security_id.as_str().to_string()).or_default();
+            if v.last().map(|d| d.day) != Some(day) {
+                v.push(DailyBar { day, close: c, high: hi, low: lo });
+            }
+        }
+    }
+    Ok(m)
+}
+
+/// (B5) Pin-adjusted forward dividends per security: (ex_date,
+/// cash_amount × factor_at(ex_date)), sorted by ex_date. Keyed by
+/// security_id (coalesced with display_symbol).
+fn build_dividend_lookup(
+    reader: &MaterializedBarReader,
+    path: &Path,
+) -> Result<HashMap<String, Vec<(NaiveDate, f64)>>> {
+    use arrow::array::{Array, Date32Array, Float64Array, StringArray};
+    let mut m: HashMap<String, Vec<(NaiveDate, f64)>> = HashMap::new();
+    let rdr = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?.build()?;
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    for batch in rdr {
+        let b = batch?;
+        let sid = b.column_by_name("security_id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let sym = b.column_by_name("display_symbol").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let ex = b.column_by_name("ex_dividend_date").unwrap().as_any().downcast_ref::<Date32Array>().unwrap();
+        let amt = b.column_by_name("cash_amount").unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
+        for i in 0..b.num_rows() {
+            if ex.is_null(i) || amt.is_null(i) {
+                continue;
+            }
+            let exd = epoch + chrono::Duration::days(ex.value(i) as i64);
+            let symbol = if sym.is_null(i) { "" } else { sym.value(i) };
+            let key = if sid.is_null(i) { symbol.to_string() } else { sid.value(i).to_string() };
+            let f = reader.adjustment_factor(&SecurityId::new(&key), symbol, exd);
+            m.entry(key).or_default().push((exd, amt.value(i) * f));
+        }
+    }
+    for v in m.values_mut() {
+        v.sort_by_key(|x| x.0);
+    }
+    Ok(m)
+}
+
+/// Forward slice of a sid's sorted daily/dividend series: entries strictly
+/// after `day`.
+fn fwd_daily<'a>(m: &'a HashMap<String, Vec<DailyBar>>, sid: &str, day: NaiveDate) -> &'a [DailyBar] {
+    match m.get(sid) {
+        Some(v) => &v[v.partition_point(|d| d.day <= day)..],
+        None => &[],
+    }
+}
+fn fwd_div<'a>(m: &'a HashMap<String, Vec<(NaiveDate, f64)>>, sid: &str, day: NaiveDate) -> &'a [(NaiveDate, f64)] {
+    match m.get(sid) {
+        Some(v) => &v[v.partition_point(|d| d.0 <= day)..],
+        None => &[],
+    }
+}
+
 fn write_table(
     dir: &Path,
     day: NaiveDate,
@@ -216,7 +294,14 @@ fn write_table(
 }
 
 /// Writes both forward tables for the front day; returns (fo_rows, fp_rows).
-fn emit_day(buf: &VecDeque<BufferedDay>, out: &Path, fwd_dir: &Path, path_dir: &Path) -> Result<(usize, usize)> {
+fn emit_day(
+    buf: &VecDeque<BufferedDay>,
+    out: &Path,
+    fwd_dir: &Path,
+    path_dir: &Path,
+    matrix: &HashMap<String, Vec<DailyBar>>,
+    div: &HashMap<String, Vec<(NaiveDate, f64)>>,
+) -> Result<(usize, usize)> {
     let d0 = &buf[0];
     let day = d0.day;
     let ctx_path = out.join("daily_observation").join(format!("{day}.parquet"));
@@ -239,6 +324,8 @@ fn emit_day(buf: &VecDeque<BufferedDay>, out: &Path, fwd_dir: &Path, path_dir: &
                 days,
                 entry_ctx: ctx_map.get(sid).copied().unwrap_or_default(),
                 entry_day_factor: d0.factor.get(sid).copied().unwrap_or(1.0),
+                forward_daily: fwd_daily(matrix, sid, day),
+                dividends_fwd: fwd_div(div, sid, day),
             }
         })
         .collect();
@@ -307,6 +394,26 @@ fn main() -> Result<()> {
         t0.elapsed()
     );
 
+    // B5: forward daily-aggregate matrix over [first, last + 252 trading days]
+    // (multi-day horizons need a daily series the ring buffer can't reach) +
+    // pin-adjusted dividend lookup.
+    let mut matrix_end = last;
+    for _ in 0..252 {
+        match matrix_end.succ_opt().and_then(|d| calendar.next_trading_day(d)) {
+            Some(d) => matrix_end = d,
+            None => break,
+        }
+    }
+    let matrix_days: Vec<NaiveDate> =
+        all_days.iter().copied().filter(|d| *d >= first && *d <= matrix_end).collect();
+    let mt = Instant::now();
+    let matrix = build_daily_matrix(&reader, &calendar, &matrix_days)?;
+    let dividends = build_dividend_lookup(&reader, &args.reference.join("dividends.parquet"))?;
+    println!(
+        "daily matrix: {} securities over {} days through {matrix_end} ({:.1?}); dividends: {} securities",
+        matrix.len(), matrix_days.len(), mt.elapsed(), dividends.len()
+    );
+
     let fwd_dir = args.out.join(FWD_TABLE);
     let path_dir = args.out.join(FWD_PATH_TABLE);
     let mut buf: VecDeque<BufferedDay> = VecDeque::with_capacity(2 + FORWARD_DAYS);
@@ -326,7 +433,7 @@ fn main() -> Result<()> {
             skipped += 1;
             return Ok(());
         }
-        let (fo, fp) = emit_day(buf, &args.out, &fwd_dir, &path_dir)?;
+        let (fo, fp) = emit_day(buf, &args.out, &fwd_dir, &path_dir, &matrix, &dividends)?;
         cursor.mark_done(FWD_TABLE, day)?;
         cursor.mark_done(FWD_PATH_TABLE, day)?;
         written += 1;

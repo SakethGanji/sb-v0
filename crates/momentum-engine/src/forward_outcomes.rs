@@ -45,8 +45,8 @@ use arrow::datatypes::Int32Type;
 use chrono::{DateTime, NaiveDate, Utc};
 use momentum_core::bar::Bar;
 use momentum_core::phase0_outputs::{
-    ATR_THRESHOLDS_V2, ENTRY_OFFSETS_V1, PCT_THRESHOLDS_V2, TARGET_STOP_PAIRS_V6,
-    forward_outcomes_schema,
+    ATR_THRESHOLDS_V2, ENTRY_OFFSETS_V1, FORWARD_HORIZONS_V2, PCT_THRESHOLDS_V2,
+    TARGET_STOP_PAIRS_V6, forward_outcomes_schema,
 };
 use std::sync::Arc;
 
@@ -134,7 +134,28 @@ pub struct ForwardInput<'a> {
     /// `factor_at(D)` for this security — used to recover the raw
     /// (unadjusted) entry price from the D-basis adjusted open.
     pub entry_day_factor: f64,
+    /// (B5) This security's pin-adjusted daily bars for D+1, D+2, … (sorted),
+    /// up to ~252 trading days ahead. Drives the 10d–252d horizons (daily
+    /// resolution) and `ret_<H>_total`. Empty until B5.
+    pub forward_daily: &'a [DailyBar],
+    /// (B5) Pin-adjusted cash dividends with ex-date in (D, …], sorted by
+    /// ex-date, for `ret_<H>_total` + `dividend_ex_date_within_<H>`.
+    pub dividends_fwd: &'a [(NaiveDate, f64)],
 }
+
+/// One security's pin-adjusted daily aggregate (RTH) for a forward day.
+#[derive(Clone, Copy, Debug)]
+pub struct DailyBar {
+    pub day: NaiveDate,
+    pub close: f64,
+    pub high: f64,
+    pub low: f64,
+}
+
+/// Long horizons (10d–252d) resolved at DAILY resolution (label, trading-day
+/// count). The ≤5d horizons stay 1m (B3).
+const LONG_HORIZONS: &[(&str, usize)] =
+    &[("10d", 10), ("21d", 21), ("42d", 42), ("63d", 63), ("252d", 252)];
 
 /// Per-horizon path statistics, all measured from `entry_price` over the
 /// RTH bars in `[entry_bar, horizon_end]`.
@@ -192,6 +213,10 @@ struct EntryRow {
     // cumulative pre-entry volume (04:00 ET → entry bar inclusive)
     cum_volume_to_entry: Option<f64>,
     cum_dollar_volume_to_entry: Option<f64>,
+    // (B5) multi-day horizons (10d–252d) + ret_total + dividend flags
+    multiday: Option<MultiDay>,
+    // (B5) bar_gap_minutes_max per the 13 horizons (None for blank rows)
+    bar_gap: Vec<Option<i32>>,
 }
 
 /// Parse an offset label like "0935" or "1530" into ET (hour, minute).
@@ -806,6 +831,48 @@ pub fn build(day: NaiveDate, inputs: &[ForwardInput<'_>]) -> Result<RecordBatch,
     fill.insert("cumulative_volume_to_entry", Arc::new(rows.iter().map(|r| r.cum_volume_to_entry).collect::<Float64Array>()) as ArrayRef);
     fill.insert("cumulative_dollar_volume_to_entry", Arc::new(rows.iter().map(|r| r.cum_dollar_volume_to_entry).collect::<Float64Array>()) as ArrayRef);
 
+    // B5: multi-day horizon stats (10d–252d, daily resolution).
+    let md = |get: &dyn Fn(&HorizonStat) -> Option<f64>, hi: usize| -> ArrayRef {
+        Arc::new(rows.iter().map(|r| r.multiday.as_ref().and_then(|m| get(&m.stats[hi]))).collect::<Float64Array>()) as ArrayRef
+    };
+    let mdu = |get: &dyn Fn(&HorizonStat) -> Option<u32>, hi: usize| -> ArrayRef {
+        Arc::new(rows.iter().map(|r| r.multiday.as_ref().and_then(|m| get(&m.stats[hi]))).collect::<UInt32Array>()) as ArrayRef
+    };
+    let idx_pos: Vec<Option<usize>> = INDEX_SIDS.iter().map(|s| inputs.iter().position(|i| i.display_symbol == *s)).collect();
+    for (hi, (label, _)) in LONG_HORIZONS.iter().enumerate() {
+        fill.insert(leak(format!("ret_{label}")), md(&|s| s.ret, hi));
+        fill.insert(leak(format!("max_drawdown_{label}")), md(&|s| s.max_drawdown, hi));
+        fill.insert(leak(format!("max_runup_{label}")), md(&|s| s.max_runup, hi));
+        fill.insert(leak(format!("close_max_ret_{label}")), md(&|s| s.close_max_ret, hi));
+        fill.insert(leak(format!("close_min_ret_{label}")), md(&|s| s.close_min_ret, hi));
+        fill.insert(leak(format!("bars_to_max_drawdown_{label}")), mdu(&|s| s.bars_to_max_drawdown, hi));
+        fill.insert(leak(format!("bars_to_max_runup_{label}")), mdu(&|s| s.bars_to_max_runup, hi));
+        fill.insert(leak(format!("bars_to_close_min_{label}")), mdu(&|s| s.bars_to_close_min, hi));
+        fill.insert(leak(format!("bars_to_close_max_{label}")), mdu(&|s| s.bars_to_close_max, hi));
+        // excess vs each index at the same offset
+        for (j, idx) in ["spy", "qqq", "iwm"].iter().enumerate() {
+            let vals: Vec<Option<f64>> = (0..total)
+                .map(|ri| {
+                    let oi = ri % n_offsets;
+                    let sec = rows[ri].multiday.as_ref().and_then(|m| m.stats[hi].ret)?;
+                    let ip = idx_pos[j]?;
+                    let iret = rows[ip * n_offsets + oi].multiday.as_ref().and_then(|m| m.stats[hi].ret)?;
+                    Some(sec - iret)
+                })
+                .collect();
+            fill.insert(leak(format!("ret_{label}_excess_{idx}")), Arc::new(Float64Array::from(vals)) as ArrayRef);
+        }
+    }
+    // ret_<H>_total + dividend_ex_date_within_<H> (9 multi-day horizons)
+    for (hi, (label, _)) in MULTIDAY_DAYS.iter().enumerate() {
+        fill.insert(leak(format!("ret_{label}_total")), Arc::new(rows.iter().map(|r| r.multiday.as_ref().and_then(|m| m.ret_total[hi])).collect::<Float64Array>()) as ArrayRef);
+        fill.insert(leak(format!("dividend_ex_date_within_{label}")), Arc::new(rows.iter().map(|r| r.multiday.as_ref().and_then(|m| m.div_ex[hi])).collect::<BooleanArray>()) as ArrayRef);
+    }
+    // bar_gap_minutes_max_<H> for all 13 horizons (short from 1m tape; long null)
+    for (hi, label) in FORWARD_HORIZONS_V2.iter().enumerate() {
+        fill.insert(leak(format!("bar_gap_minutes_max_{label}")), Arc::new(rows.iter().map(|r| r.bar_gap.get(hi).copied().flatten()).collect::<Int32Array>()) as ArrayRef);
+    }
+
     // Cross-sectional pre-entry ranks — ranked across the universe at each
     // entry_offset (rank 1 = largest, percentile = (m-1-r0)/m; ranks_desc,
     // matching daily_observation). Rows are inp-major: index = sec*offsets +
@@ -902,6 +969,8 @@ fn resolve_entry(
         aux: None,
         cum_volume_to_entry: None,
         cum_dollar_volume_to_entry: None,
+        multiday: None,
+        bar_gap: vec![None; FORWARD_HORIZONS_V2.len()],
     };
     let d0 = match inp.days.first() {
         Some(d) if !d.rth_bars.is_empty() => d,
@@ -947,10 +1016,16 @@ fn resolve_entry(
         Some(ctx.premarket_dollar_volume.unwrap_or(0.0) + pre_dollar + dollar_1m);
 
     // ---- horizons + crossings + labels + day-0/next-day/gap families ----
-    let (tape, ends) = build_tape_and_ends(inp, eidx);
+    let (tape, bounds) = build_tape_with_bounds(inp, eidx);
+    let entry_t = inp.days[0].rth_bars[eidx].t;
+    let ends = ends_from_bounds(&tape, &bounds, entry_t);
     let horizons = resolve_horizons(&tape, entry_price, &ends);
     let cross = compute_cross_labels(&tape, entry_price, ctx.atr_14d, &ends);
     let aux = compute_aux(day, inp, eidx, entry_price, &tape, &ends);
+    // ---- B5: multi-day horizons + ret_total + dividend flags + bar_gap ----
+    let (d0_hi, d0_lo, d0_c) = day0_extremes(&tape, bounds[0]);
+    let multiday = compute_multiday(entry_price, d0_hi, d0_lo, d0_c, inp.forward_daily, inp.dividends_fwd);
+    let bar_gap = compute_bar_gap(&tape, &ends, &bounds);
     let excess: Vec<[Option<f64>; 3]> = horizons
         .iter()
         .enumerate()
@@ -1003,6 +1078,8 @@ fn resolve_entry(
         aux: Some(aux),
         cum_volume_to_entry,
         cum_dollar_volume_to_entry,
+        multiday: Some(multiday),
+        bar_gap,
     }
 }
 
@@ -1059,19 +1136,127 @@ pub(crate) fn intraday_end(
     last
 }
 
-fn build_tape_and_ends(inp: &ForwardInput<'_>, eidx: usize) -> (Vec<Bar>, Vec<Option<usize>>) {
-    let (tape, bounds) = build_tape_with_bounds(inp, eidx);
-    let entry_t = inp.days[0].rth_bars[eidx].t;
+/// `SHORT_HORIZONS` end indices into the tape, from precomputed bounds.
+fn ends_from_bounds(tape: &[Bar], bounds: &[Option<(usize, usize)>; 6], entry_t: DateTime<Utc>) -> Vec<Option<usize>> {
     let day0_close = bounds[0].map(|(_, c)| c);
-    let ends: Vec<Option<usize>> = SHORT_HORIZONS
+    SHORT_HORIZONS
         .iter()
         .map(|h| match h {
-            Horizon::Intraday(_, mins) => intraday_end(&tape, day0_close, entry_t, *mins),
+            Horizon::Intraday(_, mins) => intraday_end(tape, day0_close, entry_t, *mins),
             Horizon::Eod => day0_close,
             Horizon::Day(_, k) => bounds[*k].map(|(_, c)| c),
         })
+        .collect()
+}
+
+/// (B5) Day-D intraday extremes from the entry bar (tape[0..=day0_close]):
+/// (high, low, close). The day-0 contribution to multi-day path stats.
+fn day0_extremes(tape: &[Bar], day0: Option<(usize, usize)>) -> (f64, f64, f64) {
+    let (s, c) = day0.expect("day 0 present for a valid entry");
+    let mut hi = f64::NEG_INFINITY;
+    let mut lo = f64::INFINITY;
+    for b in &tape[s..=c] {
+        hi = hi.max(b.high);
+        lo = lo.min(b.low);
+    }
+    (hi, lo, tape[c].close)
+}
+
+/// Trading-day counts for the 9 `MULTIDAY_HORIZONS_V2` (ret_total + ex-date).
+const MULTIDAY_DAYS: &[(&str, usize)] = &[
+    ("1d", 1), ("2d", 2), ("3d", 3), ("5d", 5),
+    ("10d", 10), ("21d", 21), ("42d", 42), ("63d", 63), ("252d", 252),
+];
+
+/// (B5) Multi-day horizon stats (10d–252d, daily resolution) + `ret_<H>_total`
+/// + `dividend_ex_date_within_<H>` (9 horizons). `bars_to_*` here are in
+/// TRADING-DAY units (0 = entry day D's intraday extreme; k = D+k).
+struct MultiDay {
+    stats: Vec<HorizonStat>,      // per LONG_HORIZONS (5); excess computed in build()
+    ret_total: Vec<Option<f64>>,  // per MULTIDAY_DAYS (9)
+    div_ex: Vec<Option<bool>>,    // per MULTIDAY_DAYS (9)
+}
+
+fn compute_multiday(
+    entry: f64,
+    day0_high: f64,
+    day0_low: f64,
+    day0_close: f64,
+    forward_daily: &[DailyBar],
+    dividends_fwd: &[(NaiveDate, f64)],
+) -> MultiDay {
+    let stats = LONG_HORIZONS
+        .iter()
+        .map(|&(_, h)| {
+            if forward_daily.len() < h {
+                return HorizonStat::default();
+            }
+            let win = &forward_daily[..h];
+            // running extremes: index 0 = day D intraday, k = D+k (1-based)
+            let (mut mh, mut mh_at) = (day0_high, 0u32);
+            let (mut ml, mut ml_at) = (day0_low, 0u32);
+            let (mut mc, mut mc_at) = (day0_close, 0u32);
+            let (mut nc, mut nc_at) = (day0_close, 0u32);
+            for (i, db) in win.iter().enumerate() {
+                let k = i as u32 + 1;
+                if db.high > mh { mh = db.high; mh_at = k; }
+                if db.low < ml { ml = db.low; ml_at = k; }
+                if db.close > mc { mc = db.close; mc_at = k; }
+                if db.close < nc { nc = db.close; nc_at = k; }
+            }
+            HorizonStat {
+                ret: Some(win[h - 1].close / entry - 1.0),
+                max_runup: Some(mh / entry - 1.0),
+                bars_to_max_runup: Some(mh_at),
+                max_drawdown: Some(ml / entry - 1.0),
+                bars_to_max_drawdown: Some(ml_at),
+                close_max_ret: Some(mc / entry - 1.0),
+                bars_to_close_max: Some(mc_at),
+                close_min_ret: Some(nc / entry - 1.0),
+                bars_to_close_min: Some(nc_at),
+            }
+        })
         .collect();
-    (tape, ends)
+
+    let mut ret_total = Vec::with_capacity(MULTIDAY_DAYS.len());
+    let mut div_ex = Vec::with_capacity(MULTIDAY_DAYS.len());
+    for &(_, h) in MULTIDAY_DAYS {
+        if forward_daily.len() < h {
+            ret_total.push(None);
+            div_ex.push(None);
+            continue;
+        }
+        let day_h = forward_daily[h - 1].day;
+        let close_h = forward_daily[h - 1].close;
+        let div_sum: f64 = dividends_fwd.iter().filter(|(ex, _)| *ex <= day_h).map(|(_, a)| *a).sum();
+        let any = dividends_fwd.iter().any(|(ex, _)| *ex <= day_h);
+        ret_total.push(Some((close_h + div_sum) / entry - 1.0));
+        div_ex.push(Some(any));
+    }
+
+    MultiDay { stats, ret_total, div_ex }
+}
+
+/// (B5) `bar_gap_minutes_max_<H>` for the 13 horizons: largest intra-RTH
+/// (same-day) gap between consecutive bars in `[entry, end]`. From the 1m
+/// tape for the 8 short horizons; null for the 5 long horizons (no 1m).
+fn compute_bar_gap(tape: &[Bar], ends: &[Option<usize>], bounds: &[Option<(usize, usize)>; 6]) -> Vec<Option<i32>> {
+    let day_start: std::collections::HashSet<usize> =
+        bounds.iter().skip(1).filter_map(|b| b.map(|(s, _)| s)).collect();
+    // running max same-day gap up to each tape index
+    let mut prefix = vec![0i32; tape.len()];
+    let mut run = 0i32;
+    for i in 1..tape.len() {
+        if !day_start.contains(&i) {
+            let g = (tape[i].t - tape[i - 1].t).num_minutes() as i32;
+            run = run.max(g);
+        }
+        prefix[i] = run;
+    }
+    // 13 horizons: first 8 are SHORT (ends), last 5 LONG (null)
+    let mut out: Vec<Option<i32>> = ends.iter().map(|e| e.map(|e| prefix[e])).collect();
+    out.extend(std::iter::repeat_n(None, LONG_HORIZONS.len()));
+    out
 }
 
 #[cfg(test)]
@@ -1098,6 +1283,8 @@ mod tests {
             days,
             entry_ctx: EntryCtx::default(),
             entry_day_factor: 1.0,
+            forward_daily: &[],
+            dividends_fwd: &[],
         };
         resolve_entry(days[0].day, &inp, off, &Default::default())
     }
@@ -1221,6 +1408,8 @@ mod tests {
             days: &[fday(day, bars.clone())],
             entry_ctx: EntryCtx { atr_14d: Some(1.0), ..Default::default() },
             entry_day_factor: 1.0,
+            forward_daily: &[],
+            dividends_fwd: &[],
         };
         let r = resolve_entry(day, &inp, "0935", &Default::default());
         assert_eq!(cross_atr(&r, "EOD", "1", false), Some(3));
@@ -1332,6 +1521,8 @@ mod tests {
                 ..Default::default()
             },
             entry_day_factor: 1.0,
+            forward_daily: &[],
+            dividends_fwd: &[],
         };
         // entry at 09:35 (idx0): RTH-through-entry = the entry bar only.
         let r = resolve_entry(day, &inp, "0935", &Default::default());

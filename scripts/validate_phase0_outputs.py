@@ -1673,12 +1673,24 @@ def _fo_resolve(per_day_bars, off, atr14=None, pm_vol=0.0, pm_dollar=0.0):
             gap_rth[k - 1] = [o / prev - 1.0, c / o - 1.0, c / prev - 1.0, c / o - 1.0]
         prev = cur[-1][4] if cur else None
 
+    # bar_gap_minutes_max (short horizons): max same-day consecutive bar gap.
+    # tape minutes ascend within a day and reset at a day boundary, so
+    # minute[i] > minute[i-1] ⟺ same day (overnight gaps excluded).
+    pgap = [0] * len(tape)
+    rung = 0
+    for i in range(1, len(tape)):
+        if tape[i][0] > tape[i - 1][0]:
+            rung = max(rung, tape[i][0] - tape[i - 1][0])
+        pgap[i] = rung
+    bar_gap = {lab: (pgap[ends[lab]] if ends[lab] is not None else None) for lab, _, _ in FO_HORIZONS}
+
     pre = d0[:eidx]
     pre_vol = sum(b[5] for b in pre)
     pre_high = max((b[2] for b in pre), default=None)
     return {
         "entry_price": ep,
         "is_halted_at_entry": ebar[0] > entry_min,
+        "bar_gap": bar_gap,
         "pre_entry_ret_from_open": ep / rth_open - 1.0,
         "pre_entry_volume_from_open": pre_vol,
         "pre_entry_high_return_so_far": (pre_high / rth_open - 1.0) if pre else None,
@@ -1854,6 +1866,14 @@ def forward_outcomes_checks(d):
                     col = f"{fam}_day_{k}"
                     r.check(f"{tag} {col}", close_enough(row[col], exp["gap_rth"][k - 1][j]),
                             f"eng={row[col]} indep={exp['gap_rth'][k-1][j]}")
+            # bar_gap_minutes_max: 8 short horizons from the 1m tape; 5 long null
+            for lab, _, _ in FO_HORIZONS:
+                r.check(f"{tag} bar_gap_minutes_max_{lab}",
+                        row[f"bar_gap_minutes_max_{lab}"] == exp["bar_gap"][lab],
+                        f"eng={row[f'bar_gap_minutes_max_{lab}']} indep={exp['bar_gap'][lab]}")
+            for lab in ["10d", "21d", "42d", "63d", "252d"]:
+                r.check(f"{tag} bar_gap_minutes_max_{lab} null",
+                        row[f"bar_gap_minutes_max_{lab}"] is None, f"eng={row[f'bar_gap_minutes_max_{lab}']}")
             # cumulative pre-entry volume
             r.check(f"{tag} cumulative_volume_to_entry",
                     close_enough(row["cumulative_volume_to_entry"], exp["cum_vol"]),
@@ -1895,6 +1915,7 @@ def forward_property_sweep(days_all):
         "is_halted null when entry present",
         "B5 horizon crossing not null", "first_event out of domain",
         "hit != (first_event==target_first)",
+        "bar_gap 10d+ not null", "ret_252d outside [dd,runup]",
     ]}
     grid = {"0935", "0940", "0945", "0950", "0955", "1000", "1005", "1010",
             "1015", "1020", "1030", "1045", "1100", "1130", "1200", "1300", "1530"}
@@ -1932,7 +1953,18 @@ def forward_property_sweep(days_all):
         viol["is_halted null when entry present"] += t.filter(
             pl.col("entry_price").is_not_null() & pl.col("is_halted_at_entry").is_null()
         ).height
-        # B5 horizons (10d+) must stay null in B3-partial; label domain + hit↔event
+        # B5: bar_gap is null for the 5 long horizons; ret_252d within [dd,runup]
+        b5 = pl.read_parquet(p, columns=[
+            "bar_gap_minutes_max_10d", "bar_gap_minutes_max_252d",
+            "ret_252d", "max_drawdown_252d", "max_runup_252d"])
+        viol["bar_gap 10d+ not null"] += b5.filter(
+            pl.col("bar_gap_minutes_max_10d").is_not_null()
+            | pl.col("bar_gap_minutes_max_252d").is_not_null()).height
+        viol["ret_252d outside [dd,runup]"] += b5.filter(
+            pl.col("ret_252d").is_not_null()
+            & ((pl.col("ret_252d") < pl.col("max_drawdown_252d") - 1e-9)
+               | (pl.col("ret_252d") > pl.col("max_runup_252d") + 1e-9))).height
+        # B5b-deferred crossings (10d+) stay null; label domain + hit↔event
         lab = pl.read_parquet(p, columns=[
             "first_cross_up_1pct_10d", "first_cross_up_1pct_252d",
             "first_event_1pct_before_minus_1pct_EOD", "hit_1pct_before_minus_1pct_EOD",
@@ -1952,6 +1984,137 @@ def forward_property_sweep(days_all):
         ).height
     for k, n in viol.items():
         r.check(f"fo property: {k}", n == 0, f"violations={n}")
+
+
+# ---------------------------------------------------------------------------
+# L5. forward_outcomes B5 multi-day (10d–252d) + ret_total + bar_gap
+# ---------------------------------------------------------------------------
+
+LONG_H = [("10d", 10), ("21d", 21), ("42d", 42), ("63d", 63), ("252d", 252)]
+MD_DAYS = [("1d", 1), ("2d", 2), ("3d", 3), ("5d", 5), ("10d", 10),
+           ("21d", 21), ("42d", 42), ("63d", 63), ("252d", 252)]
+FO_HORIZON_LABELS = ["10min", "30min", "60min", "EOD", "1d", "2d", "3d", "5d",
+                     "10d", "21d", "42d", "63d", "252d"]
+_MD_CACHE = {}  # (day_str) -> {sym: (close,high,low) pin-adjusted RTH}
+
+
+def _md_daily(d, syms):
+    """Pin-adjusted RTH (close,high,low) for syms on day d, cached."""
+    if d not in _MD_CACHE:
+        sp_all, pin = _fo_splits()
+        bars = load_day_bars(d)
+        close_t = spy_session_close(bars)
+        out = {}
+        sub = bars.filter(
+            pl.col("display_symbol").is_in(list(syms))
+            & (pl.col("et_time") >= time(9, 30)) & (pl.col("et_time") <= close_t)
+        ).sort("t")
+        for sym, g in sub.group_by("display_symbol"):
+            sym = sym[0]
+            f = _fo_factor(sp_all, pin, sym, d)
+            out[sym] = (g["close"][-1] * f, g["high"].max() * f, g["low"].min() * f)
+        _MD_CACHE[d] = out
+    return _MD_CACHE[d]
+
+
+def _md_dividends(sym):
+    sp_all, pin = _fo_splits()
+    dv = pl.read_parquet(REF / "dividends.parquet",
+                         columns=["display_symbol", "ex_dividend_date", "cash_amount"]).filter(
+        pl.col("display_symbol") == sym)
+    out = []
+    for r in dv.iter_rows(named=True):
+        ex = r["ex_dividend_date"]
+        if ex is None or r["cash_amount"] is None:
+            continue
+        out.append((ex, r["cash_amount"] * _fo_factor(sp_all, pin, sym, ex)))
+    return sorted(out)
+
+
+def forward_multiday_checks(d):
+    corpus = corpus_trading_days()
+    if d not in corpus:
+        return
+    i0 = corpus.index(d)
+    do = pl.read_parquet(OUT / "daily_observation" / f"{d}.parquet",
+                         columns=["security_id", "display_symbol_on_day"])
+    sym2sid = {r["display_symbol_on_day"]: r["security_id"] for r in do.iter_rows(named=True)
+               if r["display_symbol_on_day"] in SAMPLE}
+    eng = pl.read_parquet(OUT / "forward_outcomes" / f"{d}.parquet").filter(
+        pl.col("security_id").is_in(list(sym2sid.values())))
+    allsyms = set(sym2sid) | {"SPY", "QQQ", "IWM"}
+    # forward daily series per sym (traded days after D): (date, close, high, low)
+    fwd = {s: [] for s in allsyms}
+    j = i0 + 1
+    while j < len(corpus) and any(len(fwd[s]) < 252 for s in allsyms):
+        dd = _md_daily(corpus[j], allsyms)
+        dat = date.fromisoformat(corpus[j]) if isinstance(corpus[j], str) else corpus[j]
+        for s in allsyms:
+            if s in dd:
+                fwd[s].append((dat, *dd[s]))
+        j += 1
+    divs = {s: _md_dividends(s) for s in sym2sid}
+    bars_d = load_day_bars(d)
+    ct = spy_session_close(bars_d)
+    sp_all, pin = _fo_splits()
+    rows = {(row["security_id"], row["entry_offset"]): row for row in eng.iter_rows(named=True)}
+
+    def day0_extremes(sym, em):
+        f0 = _fo_factor(sp_all, pin, sym, d)
+        b0 = bars_d.filter((pl.col("display_symbol") == sym) & (pl.col("et_time") >= time(9, 30))
+                           & (pl.col("et_time") <= ct)).sort("t")
+        b0 = b0.filter(pl.col("et_time").map_elements(
+            lambda x: x.hour * 60 + x.minute >= em, return_dtype=pl.Boolean))
+        if not b0.height:
+            return None
+        return (b0["high"].max() * f0, b0["low"].min() * f0, b0["close"][-1] * f0)
+
+    for sym, sid in sym2sid.items():
+        for off in FO_OFFSETS:
+            row = rows[(sid, off)]
+            ep = row["entry_price"]
+            tag = f"{d} {sym}@{off} MD"
+            if ep is None:
+                continue
+            em = int(off[:2]) * 60 + int(off[2:])
+            ext = day0_extremes(sym, em)
+            if ext is None:
+                continue
+            d0_hi, d0_lo, d0_c = ext
+            series = fwd[sym]
+            spy_row = rows.get((sym2sid.get("SPY"), off))
+            for label, H in LONG_H:
+                if len(series) < H:
+                    r.check(f"{tag} ret_{label} null", row[f"ret_{label}"] is None, f"eng={row[f'ret_{label}']}")
+                    continue
+                win = series[:H]
+                ret = win[H - 1][1] / ep - 1
+                runup = max([d0_hi] + [x[2] for x in win]) / ep - 1
+                dd_ = min([d0_lo] + [x[3] for x in win]) / ep - 1
+                cmax = max([d0_c] + [x[1] for x in win]) / ep - 1
+                cmin = min([d0_c] + [x[1] for x in win]) / ep - 1
+                for col, w in [(f"ret_{label}", ret), (f"max_runup_{label}", runup),
+                               (f"max_drawdown_{label}", dd_), (f"close_max_ret_{label}", cmax),
+                               (f"close_min_ret_{label}", cmin)]:
+                    r.check(f"{tag} {col}", close_enough(row[col], w), f"eng={row[col]} indep={w}")
+                # excess consistency: engine excess == eng ret(sym) - eng ret(SPY)
+                if spy_row is not None and spy_row[f"ret_{label}"] is not None:
+                    want_x = row[f"ret_{label}"] - spy_row[f"ret_{label}"]
+                    r.check(f"{tag} ret_{label}_excess_spy",
+                            close_enough(row[f"ret_{label}_excess_spy"], want_x),
+                            f"eng={row[f'ret_{label}_excess_spy']} indep={want_x}")
+            dv = divs[sym]
+            for label, H in MD_DAYS:
+                if len(series) < H:
+                    continue
+                day_h = series[H - 1][0]
+                div_sum = sum(a for ex, a in dv if d < ex <= day_h)
+                rt = (series[H - 1][1] + div_sum) / ep - 1
+                anydiv = any(d < ex <= day_h for ex, a in dv)
+                r.check(f"{tag} ret_{label}_total", close_enough(row[f"ret_{label}_total"], rt),
+                        f"eng={row[f'ret_{label}_total']} indep={rt}")
+                r.check(f"{tag} dividend_ex_date_within_{label}",
+                        row[f"dividend_ex_date_within_{label}"] == anydiv, "")
 
 
 # ---------------------------------------------------------------------------
@@ -2208,6 +2371,7 @@ def main():
         sector_checks(d, obs, smap)
         classification_checks(d, obs, jr, colls, ref_idx, shares_map, praw)
         forward_outcomes_checks(d)
+        forward_multiday_checks(d)
         forward_path_checks(d)
 
     regime_checks(days_all)
