@@ -39,22 +39,22 @@ layer that consumes these tables).
 | B0 engine skeleton + benchmark | ✅ done |
 | B1 `daily_observation` + `market_context_daily` | ✅ complete & L2-validated |
 | B2 `earnings_calendar`, `sector_aggregates_daily`, `security_classification_daily`, `regime_definitions` | ✅ complete & L2-validated |
-| B3 `forward_outcomes` short horizons | ✅ **complete & L2-validated** (stamped `B3`) |
+| B3 `forward_outcomes` short horizons | ✅ **complete & L2-validated** (stamped `B5`) |
 | B4 `forward_path_short` | ✅ **complete & L2-validated** (stamped `B4`) |
-| B5 multi-day horizons + dividends + terminal events | ⬜ **NEXT** |
-| B6 golden-day fixtures + **full 2016–2026 sweep** | ⬜ |
-| Independent validation battery | ✅ 67,915/67,915 on B1+B2+B3+B4 |
+| B5 multi-day horizons + dividends + terminal events | ✅ **complete** — `forward_outcomes` at all 657 cols |
+| B6 golden-day fixtures + **full 2016–2026 sweep** | ⬜ **NEXT** |
+| Independent validation battery | ✅ 85,552/85,552 on B1+B2+B3+B4+B5 |
 | Workspace tests | ✅ 137 passing |
 | Determinism + resume-equality | ✅ byte-identical (B1/B2) |
 
 **Important:** only **144 days (2016-06-08 → 2016-12-30)** have been swept so
 far — a smoke window for fast iteration. The full 2,513-day sweep is B6. **All
-eight tables now exist on disk for those 144 days** (`forward_outcomes` 19.2M
-rows; `forward_path_short` 433M rows / ~16 GB). Their B5 columns
-(`forward_outcomes`: 10d+ horizons, dividend totals, bar_gap, terminal events,
-the 21d label pair) are still typed-null by design.
+eight tables now exist on disk for those 144 days, fully populated**
+(`forward_outcomes` 19.2M rows at all 657 cols; `forward_path_short` 433M rows
+/ ~16 GB). The only nulls in `forward_outcomes` are honest ones: `bar_gap` for
+10d+ (no 1m beyond D+5) and the terminal-detail columns for non-delisting names.
 
-All work through B4+validation is committed and clean. The only uncommitted
+All work through B5+validation is committed and clean. The only uncommitted
 files are `predmarket-*.md` (a different project — leave them).
 
 ---
@@ -199,10 +199,12 @@ J (regimes full recompute) + section K (property sweep over all days) +
 {0935,1000,1530} of every family — horizons, crossings, labels, day-0,
 next-day, gap, time-underwater, cumulative volume — plus full-universe rank
 self-consistency and a 12-invariant property sweep over all 144 days)** +
-**section M (B4 `forward_path_short`: per-checkpoint exact recompute of all 15
-columns for the sample + a property sweep incl. a cross-table check that
-`fp.ret` at EOD/5d_close equals `forward_outcomes.ret_<H>` over all 144 days).**
-**67,915/67,915 pass.**
+**section L5 (B5 multi-day: 10d–252d stats + daily crossings + 21d label +
+ret_total + bar_gap recomputed against an independent forward daily series,
+cached; + terminal events on real delisting securities),** **section M (B4
+`forward_path_short`: per-checkpoint exact recompute of all 15 columns + a
+cross-table `fp.ret == forward_outcomes.ret_<H>` check over all 144 days).**
+**85,552/85,552 pass.**
 
 **Also:** `scripts/check_determinism.sh` — same day written twice is
 byte-identical, and a cursor-cleared resume reproduces the file byte-for-byte.
@@ -215,7 +217,7 @@ byte-identical, and a cursor-cleared resume reproduces the file byte-for-byte.
 
 This rule was set after B2 shipped without validator coverage; the catch-up
 session (#8) then found 2 more engine bugs. Honored through B3 (3 increments,
-each with validator coverage; B4 added section M same-commit); do not skip it for B5.
+each with validator coverage; honored through B5); do not skip it for B6.
 
 ---
 
@@ -249,6 +251,16 @@ re-adjudicating** — the validator encodes them deliberately:
   offset on the 2016-11-25 half day, which fills at the 16:00 auction print),
   `is_halted_at_entry=true` and intraday horizons are measured from the ACTUAL
   fill bar, not the nominal offset (so 10/30/60min can collapse onto one bar).
+- **(B5) 10d–252d horizons are DAILY resolution.** A 252-day 1m buffer is
+  infeasible, so multi-day stats combine the day-D intraday extreme (from the
+  1m tape) with daily highs/lows D+1..D+H; `bars_to_*` and daily crossings are
+  in TRADING-DAY units. "D+H" = the H-th TRADED day after D (= calendar trading
+  days for non-gappy names). Dividends are pin-adjusted (`cash × factor_at(ex)`).
+- **(B5) terminal events never claim a delisting reason.** There is no
+  reason field on disk (only `delisted_utc`), so `terminal_event_type` is only
+  `none` or `delisted_unknown`; `terminal_event_return` carries the entry→last
+  price signal (e.g. +29% likely-merger vs −56% likely-distress) without
+  fabricating the cause. Detected from `delisted_utc`; confidence `high`.
 
 ---
 
@@ -284,7 +296,7 @@ announced-but-not-yet-executed future splits) — now excluded-with-warn.
 
 ---
 
-## 9. What's NEXT — B5 and the rest
+## 9. What's NEXT — B6 (the full sweep)
 
 ### B3 — `forward_outcomes` short horizons (✅ DONE)
 
@@ -311,9 +323,8 @@ increments (commits `8958bcd`, `502320a`, + final); 12 L1 tests; validator §L
 recomputes every family for the sample + full-universe rank self-consistency +
 property sweep (incl. B5-horizons-null, label domain, hit↔first_event).
 
-**Still null by design (B5):** 10d–252d horizons (ret/dd/runup/crossings/
-excess), `ret_<H>_total` + dividend ex-date flags, `bar_gap_minutes_max` (all
-13 horizons), terminal events, and the `3atr_before_minus_1_5atr_21d` pair.
+(The B5 columns — 10d–252d horizons, ret_total, dividend flags, bar_gap,
+terminal events, the 21d pair — are now filled; see the B5 section below.)
 
 **Adjudicated conventions** are documented at the top of
 `forward_outcomes.rs` and §6 above (entry = open of first RTH bar at/after the
@@ -342,19 +353,40 @@ checkpoint ends mirror the forward_outcomes caps; `bars_elapsed` = tape index;
 `rate_of_change` = Δret/Δbars vs the previous checkpoint; `halt_gap_crossed`
 latches on any same-day ≥5-min bar gap (overnight gaps excluded).
 
-### B5 — multi-day horizons + dividends + terminal events
+### B5 — multi-day horizons + dividends + terminal events (✅ DONE, stamp `B5`)
 
-10d–252d horizons, `ret_<H>_total` (dividend-adjusted), ex-date flags,
-`bar_gap_minutes_max`, terminal events (merger-vs-delist split). One open
-design decision: 1m vs daily resolution for 10d+ runup/drawdown (recommend
-daily; document it).
+Two increments (`B5a` `ebbcc49`, `B5b`). Needs forward data the 6-day ring
+buffer can't reach, so `write-forward-outcomes` **preloads a pin-adjusted
+daily-aggregate matrix** (close/high/low per security over [first entry, last
+entry + 252 trading days]) + a pin-adjusted dividend lookup + a delisting
+lookup (`tickers_enriched.delisted_utc`). The daily matrix is ~70s and reads
+each day's bars once just for daily OHLC — **for B6 this can read
+`daily_observation` (eod_day_*) instead, which exists corpus-wide.**
 
-### B6 — golden days + full sweep
+- **10d–252d horizons** at DAILY resolution: ret / drawdown / runup /
+  close-extremes / `bars_to_*` (TRADING-DAY units; 0 = day-D intraday extreme,
+  combined with daily extremes D+1..D+H) / excess / daily threshold crossings
+  (1-based DAY index) / the `3atr_before_minus_1_5atr_21d` label.
+- **`ret_<H>_total`** (9 horizons) = (close(D+H) + pin-adjusted dividends with
+  ex in (D, D+H]) / entry − 1; `dividend_ex_date_within_<H>`.
+- **`bar_gap_minutes_max`**: ≤5d from the 1m tape; null for 10d+ (no 1m).
+- **Terminal events** (build-state §6): `delisted_unknown` (no reason field on
+  disk — never claims merger/bankruptcy), `terminal_event_date` =
+  `delisted_utc`, `terminal_event_return` (entry → last valid price),
+  `last_valid_trade_date`, `days_with_missing_forward_bars`, confidence `high`.
+
+Validator §L5 + a delisting-security terminal check. `forward_outcomes` is now
+complete at **all 657 columns** (only honest nulls remain: `bar_gap` 10d+ and
+the terminal-detail columns for non-delisting names).
+
+### B6 — golden days + full sweep (NEXT)
 
 Hand-verified fixtures (AAPL 2020-08-31 split, FB→META 2022-06-09 rename,
 an ex-div, a LULD halt, a delisting), then the **full 2016–2026 sweep** (all
-8 tables, ~0.5s/day → a few hours). Re-run `build-regimes` afterward so
-thresholds reflect the true exploration window.
+8 tables). Note: the forward pass needs reading ~252 days past `to` for the
+daily matrix; for the full run, source the daily matrix from
+`daily_observation` (corpus-wide) rather than re-reading raw bars. Re-run
+`build-regimes` afterward so thresholds reflect the true exploration window.
 
 ---
 
@@ -396,7 +428,9 @@ Sweep order for a clean full run: `build-earnings-calendar` → `write-phase0`
 ## 11. Commit map (the build history)
 
 ```
-(this)    B4(forward_path_short): long-format 23 checkpoints + same-pass writer + §M
+(this)    B5b(forward_outcomes): daily crossings + 21d label + terminal events → B5
+ebbcc49  B5a(forward_outcomes): multi-day horizons (10d-252d) + ret_total + bar_gap
+2807e3b  B4(forward_path_short): long-format 23 checkpoints + same-pass writer + §M
 ae81838  B3(forward_outcomes): pre-entry ranks + cumulative volume — B3 COMPLETE
 502320a  B3(forward_outcomes): day-0/next-day/gap/time-underwater (increment B)
 8958bcd  B3(forward_outcomes): threshold crossings + target-before-stop labels (A)

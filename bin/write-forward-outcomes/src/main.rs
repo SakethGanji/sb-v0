@@ -48,10 +48,10 @@ use std::time::Instant;
 
 const FWD_TABLE: &str = "forward_outcomes";
 const FWD_PATH_TABLE: &str = "forward_path_short";
-/// B3 short-horizon families + B5a multi-day horizon stats (10d–252d),
-/// ret_<H>_total, dividend flags, bar_gap. B5b (daily crossings for 10d+,
-/// the 21d label pair, terminal events) flips this to `B5`.
-const FWD_MILESTONE: &str = "B5-partial";
+/// forward_outcomes complete (657 cols): B3 short-horizon families + B5
+/// multi-day horizons (10d–252d, incl. daily crossings + the 21d label) +
+/// ret_<H>_total + dividend flags + bar_gap + terminal events.
+const FWD_MILESTONE: &str = "B5";
 const FP_MILESTONE: &str = "B4";
 /// Forward trading days needed to finalize a day's short horizons.
 const FORWARD_DAYS: usize = 5;
@@ -260,6 +260,57 @@ fn build_dividend_lookup(
     Ok(m)
 }
 
+/// (B5b) security_id → delisting date (from `tickers_enriched.delisted_utc`).
+fn build_delisted_lookup(path: &Path) -> Result<HashMap<String, NaiveDate>> {
+    use arrow::array::{Array, StringArray, TimestampNanosecondArray};
+    let mut m = HashMap::new();
+    let rdr = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?.build()?;
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    for batch in rdr {
+        let b = batch?;
+        let sid = b.column_by_name("security_id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let dl = b.column_by_name("delisted_utc").unwrap().as_any().downcast_ref::<TimestampNanosecondArray>().unwrap();
+        for i in 0..b.num_rows() {
+            if sid.is_null(i) || dl.is_null(i) {
+                continue;
+            }
+            let days = dl.value(i) / 86_400_000_000_000i64; // ns → days since epoch
+            m.insert(sid.value(i).to_string(), epoch + chrono::Duration::days(days));
+        }
+    }
+    Ok(m)
+}
+
+/// (B5b) Terminal-event detection for one (security, entry day D). Reason is
+/// always `delisted_unknown` — no reason field is on disk (build-state §8).
+fn compute_terminal(
+    sid: &str,
+    day: NaiveDate,
+    delisted: &HashMap<String, NaiveDate>,
+    matrix: &HashMap<String, Vec<DailyBar>>,
+    all_days: &[NaiveDate],
+    matrix_end: NaiveDate,
+) -> momentum_engine::forward_outcomes::TerminalInfo {
+    use momentum_engine::forward_outcomes::TerminalInfo;
+    let Some(&dl) = delisted.get(sid) else { return TerminalInfo::default() };
+    if dl < day {
+        return TerminalInfo::default();
+    }
+    let series = matrix.get(sid).map(Vec::as_slice).unwrap_or(&[]);
+    let last = series.iter().rev().find(|d| d.day <= dl);
+    let window_end = dl.min(matrix_end);
+    let traded = series.iter().filter(|d| d.day > day && d.day <= window_end).count() as i32;
+    let cal = all_days.iter().filter(|d| **d > day && **d <= window_end).count() as i32;
+    TerminalInfo {
+        event_type: "delisted_unknown",
+        date: Some(dl),
+        last_valid_close: last.map(|d| d.close),
+        last_valid_trade_date: last.map(|d| d.day),
+        days_with_missing_forward_bars: Some((cal - traded).max(0)),
+        confidence: Some("high"),
+    }
+}
+
 /// Forward slice of a sid's sorted daily/dividend series: entries strictly
 /// after `day`.
 fn fwd_daily<'a>(m: &'a HashMap<String, Vec<DailyBar>>, sid: &str, day: NaiveDate) -> &'a [DailyBar] {
@@ -294,6 +345,7 @@ fn write_table(
 }
 
 /// Writes both forward tables for the front day; returns (fo_rows, fp_rows).
+#[allow(clippy::too_many_arguments)]
 fn emit_day(
     buf: &VecDeque<BufferedDay>,
     out: &Path,
@@ -301,6 +353,9 @@ fn emit_day(
     path_dir: &Path,
     matrix: &HashMap<String, Vec<DailyBar>>,
     div: &HashMap<String, Vec<(NaiveDate, f64)>>,
+    delisted: &HashMap<String, NaiveDate>,
+    all_days: &[NaiveDate],
+    matrix_end: NaiveDate,
 ) -> Result<(usize, usize)> {
     let d0 = &buf[0];
     let day = d0.day;
@@ -326,6 +381,7 @@ fn emit_day(
                 entry_day_factor: d0.factor.get(sid).copied().unwrap_or(1.0),
                 forward_daily: fwd_daily(matrix, sid, day),
                 dividends_fwd: fwd_div(div, sid, day),
+                terminal: compute_terminal(sid, day, delisted, matrix, all_days, matrix_end),
             }
         })
         .collect();
@@ -409,9 +465,10 @@ fn main() -> Result<()> {
     let mt = Instant::now();
     let matrix = build_daily_matrix(&reader, &calendar, &matrix_days)?;
     let dividends = build_dividend_lookup(&reader, &args.reference.join("dividends.parquet"))?;
+    let delisted = build_delisted_lookup(&args.reference.join("tickers_enriched.parquet"))?;
     println!(
-        "daily matrix: {} securities over {} days through {matrix_end} ({:.1?}); dividends: {} securities",
-        matrix.len(), matrix_days.len(), mt.elapsed(), dividends.len()
+        "daily matrix: {} securities over {} days through {matrix_end} ({:.1?}); dividends: {}; delisted: {}",
+        matrix.len(), matrix_days.len(), mt.elapsed(), dividends.len(), delisted.len()
     );
 
     let fwd_dir = args.out.join(FWD_TABLE);
@@ -433,7 +490,7 @@ fn main() -> Result<()> {
             skipped += 1;
             return Ok(());
         }
-        let (fo, fp) = emit_day(buf, &args.out, &fwd_dir, &path_dir, &matrix, &dividends)?;
+        let (fo, fp) = emit_day(buf, &args.out, &fwd_dir, &path_dir, &matrix, &dividends, &delisted, &all_days, matrix_end)?;
         cursor.mark_done(FWD_TABLE, day)?;
         cursor.mark_done(FWD_PATH_TABLE, day)?;
         written += 1;

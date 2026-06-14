@@ -1913,7 +1913,7 @@ def forward_property_sweep(days_all):
         "schema drift", "max_runup<0", "max_drawdown>0",
         "ret_EOD outside [dd,runup]", "close_max<close_min",
         "is_halted null when entry present",
-        "B5 horizon crossing not null", "first_event out of domain",
+        "terminal_event_type out of domain", "first_event out of domain",
         "hit != (first_event==target_first)",
         "bar_gap 10d+ not null", "ret_252d outside [dd,runup]",
     ]}
@@ -1964,14 +1964,14 @@ def forward_property_sweep(days_all):
             pl.col("ret_252d").is_not_null()
             & ((pl.col("ret_252d") < pl.col("max_drawdown_252d") - 1e-9)
                | (pl.col("ret_252d") > pl.col("max_runup_252d") + 1e-9))).height
-        # B5b-deferred crossings (10d+) stay null; label domain + hit↔event
+        # label domain + hit↔event; terminal_event_type domain (B5b)
         lab = pl.read_parquet(p, columns=[
-            "first_cross_up_1pct_10d", "first_cross_up_1pct_252d",
+            "terminal_event_type",
             "first_event_1pct_before_minus_1pct_EOD", "hit_1pct_before_minus_1pct_EOD",
         ])
-        viol["B5 horizon crossing not null"] += lab.filter(
-            pl.col("first_cross_up_1pct_10d").is_not_null()
-            | pl.col("first_cross_up_1pct_252d").is_not_null()
+        viol["terminal_event_type out of domain"] += lab.filter(
+            pl.col("terminal_event_type").is_not_null()
+            & ~pl.col("terminal_event_type").is_in(["none", "delisted_unknown"])
         ).height
         ev = "first_event_1pct_before_minus_1pct_EOD"; hh = "hit_1pct_before_minus_1pct_EOD"
         viol["first_event out of domain"] += lab.filter(
@@ -1999,22 +1999,27 @@ _MD_CACHE = {}  # (day_str) -> {sym: (close,high,low) pin-adjusted RTH}
 
 
 def _md_daily(d, syms):
-    """Pin-adjusted RTH (close,high,low) for syms on day d, cached."""
+    """Pin-adjusted RTH (close,high,low) for syms on day d. Cached per day as
+    (loaded_syms_set, {sym: val}); missing syms are loaded on demand so a
+    later caller asking for a different sym isn't starved by the first call."""
     if d not in _MD_CACHE:
+        _MD_CACHE[d] = (set(), {})
+    loaded, vals = _MD_CACHE[d]
+    missing = set(syms) - loaded
+    if missing:
         sp_all, pin = _fo_splits()
         bars = load_day_bars(d)
         close_t = spy_session_close(bars)
-        out = {}
         sub = bars.filter(
-            pl.col("display_symbol").is_in(list(syms))
+            pl.col("display_symbol").is_in(list(missing))
             & (pl.col("et_time") >= time(9, 30)) & (pl.col("et_time") <= close_t)
         ).sort("t")
         for sym, g in sub.group_by("display_symbol"):
             sym = sym[0]
             f = _fo_factor(sp_all, pin, sym, d)
-            out[sym] = (g["close"][-1] * f, g["high"].max() * f, g["low"].min() * f)
-        _MD_CACHE[d] = out
-    return _MD_CACHE[d]
+            vals[sym] = (g["close"][-1] * f, g["high"].max() * f, g["low"].min() * f)
+        loaded |= missing
+    return {s: vals[s] for s in syms if s in vals}
 
 
 def _md_dividends(sym):
@@ -2037,9 +2042,12 @@ def forward_multiday_checks(d):
         return
     i0 = corpus.index(d)
     do = pl.read_parquet(OUT / "daily_observation" / f"{d}.parquet",
-                         columns=["security_id", "display_symbol_on_day"])
-    sym2sid = {r["display_symbol_on_day"]: r["security_id"] for r in do.iter_rows(named=True)
-               if r["display_symbol_on_day"] in SAMPLE}
+                         columns=["security_id", "display_symbol_on_day", "atr_14d"])
+    sym2sid, sym2atr = {}, {}
+    for rr in do.iter_rows(named=True):
+        if rr["display_symbol_on_day"] in SAMPLE:
+            sym2sid[rr["display_symbol_on_day"]] = rr["security_id"]
+            sym2atr[rr["display_symbol_on_day"]] = rr["atr_14d"]
     eng = pl.read_parquet(OUT / "forward_outcomes" / f"{d}.parquet").filter(
         pl.col("security_id").is_in(list(sym2sid.values())))
     allsyms = set(sym2sid) | {"SPY", "QQQ", "IWM"}
@@ -2115,6 +2123,112 @@ def forward_multiday_checks(d):
                         f"eng={row[f'ret_{label}_total']} indep={rt}")
                 r.check(f"{tag} dividend_ex_date_within_{label}",
                         row[f"dividend_ex_date_within_{label}"] == anydiv, "")
+            # (B5b) daily threshold crossings (10d+) + the 21d label, daily res.
+            atr = sym2atr.get(sym)
+            have_atr = atr is not None and atr > 0
+            def fglobal(day0v, hi_idx, pred):  # first day idx: 0=day0, k=D+k
+                if pred(day0v):
+                    return 0
+                for k, x in enumerate(series):
+                    if pred(x[hi_idx]):
+                        return k + 1
+                return None
+            up_pct = {ts: fglobal(d0_hi, 2, lambda h, v=v: h >= ep * (1 + v)) for ts, v in FO_PCT}
+            dn_pct = {ts: fglobal(d0_lo, 3, lambda l, v=v: l <= ep * (1 - v)) for ts, v in FO_PCT}
+            up_atr = {ts: fglobal(d0_hi, 2, lambda h, m=m: h >= ep + m * atr) if have_atr else None for ts, m in FO_ATR}
+            dn_atr = {ts: fglobal(d0_lo, 3, lambda l, m=m: l <= ep - m * atr) if have_atr else None for ts, m in FO_ATR}
+            def rep(first, H, have):
+                if not have:
+                    return None
+                return (first + 1) if (first is not None and first <= H) else 0
+            for label, H in LONG_H:
+                have = len(series) >= H
+                for ts, _ in FO_PCT:
+                    r.check(f"{tag} first_cross_up_{ts}pct_{label}",
+                            row[f"first_cross_up_{ts}pct_{label}"] == rep(up_pct[ts], H, have), "")
+                    r.check(f"{tag} first_cross_down_{ts}pct_{label}",
+                            row[f"first_cross_down_{ts}pct_{label}"] == rep(dn_pct[ts], H, have), "")
+                for ts, _ in FO_ATR:
+                    wu = rep(up_atr[ts], H, have) if have_atr else None
+                    wd = rep(dn_atr[ts], H, have) if have_atr else None
+                    r.check(f"{tag} first_cross_up_{ts}atr_{label}", row[f"first_cross_up_{ts}atr_{label}"] == wu, "")
+                    r.check(f"{tag} first_cross_down_{ts}atr_{label}", row[f"first_cross_down_{ts}atr_{label}"] == wd, "")
+            # 21d label: 3atr before −1.5atr, daily, within 21 days
+            if len(series) < 21 or not have_atr:
+                ev21 = "no_data"
+            else:
+                up = fglobal(d0_hi, 2, lambda h: h >= ep + 3 * atr)
+                dn = fglobal(d0_lo, 3, lambda l: l <= ep - 1.5 * atr)
+                up = up if (up is not None and up <= 21) else None
+                dn = dn if (dn is not None and dn <= 21) else None
+                ev21 = ("neither" if up is None and dn is None else
+                        "target_first" if dn is None else
+                        "stop_first" if up is None else
+                        ("target_first" if up < dn else "stop_first"))
+            r.check(f"{tag} first_event_3atr_before_minus_1_5atr_21d",
+                    row["first_event_3atr_before_minus_1_5atr_21d"] == ev21, "")
+            # sample names never delist → terminal_event_type "none"
+            r.check(f"{tag} terminal none",
+                    row["terminal_event_type"] == "none" and row["terminal_event_date"] is None
+                    and row["terminal_event_return"] is None, f"type={row['terminal_event_type']}")
+
+
+def forward_terminal_checks(d, n_check=3):
+    """Verify terminal-event detection on real delisting securities."""
+    fo_path = OUT / "forward_outcomes" / f"{d}.parquet"
+    if not fo_path.exists():
+        return
+    corpus = corpus_trading_days()
+    if d not in corpus:
+        return
+    # engine matrix_end = last swept write day + 252 trading days
+    last_write = max(date.fromisoformat(p.stem) for p in (OUT / "daily_observation").glob("*.parquet"))
+    me = corpus.index(last_write)
+    matrix_end = corpus[min(me + 252, len(corpus) - 1)]
+    te = pl.read_parquet(REF / "tickers_enriched.parquet",
+                         columns=["security_id", "delisted_utc"]).filter(pl.col("delisted_utc").is_not_null())
+    te = te.with_columns(pl.col("delisted_utc").dt.date().alias("dl"))
+    dlmap = {r["security_id"]: r["dl"] for r in te.iter_rows(named=True)}
+    do = pl.read_parquet(OUT / "daily_observation" / f"{d}.parquet",
+                         columns=["security_id", "display_symbol_on_day"])
+    # securities trading on d that delist within (d, +120 trading days]
+    horizon = corpus[min(corpus.index(d) + 120, len(corpus) - 1)]
+    cands = [(r["security_id"], r["display_symbol_on_day"]) for r in do.iter_rows(named=True)
+             if r["security_id"] in dlmap and d < dlmap[r["security_id"]] <= horizon][:n_check]
+    eng = pl.read_parquet(fo_path)
+    sp_all, pin = _fo_splits()
+    for sid, sym in cands:
+        dl = dlmap[sid]
+        # this security's traded (date, adj close) for d+1.. up to dl
+        series = []
+        k = corpus.index(d) + 1
+        while k < len(corpus) and corpus[k] <= dl:
+            dd = _md_daily(corpus[k], {sym})
+            if sym in dd:
+                series.append((corpus[k], dd[sym][0]))
+            k += 1
+        last = series[-1] if series else None
+        window_end = min(dl, matrix_end)
+        traded = sum(1 for dt_, _ in series if dt_ <= window_end)
+        cal = sum(1 for x in corpus if d < x <= window_end)
+        rw = eng.filter((pl.col("security_id") == sid) & (pl.col("entry_offset") == "1000"))
+        if rw.height != 1:
+            continue
+        row = rw.to_dicts()[0]
+        tag = f"{d} {sym}(delist {dl})"
+        r.check(f"{tag} type", row["terminal_event_type"] == "delisted_unknown", f"={row['terminal_event_type']}")
+        r.check(f"{tag} date", row["terminal_event_date"] == dl, f"={row['terminal_event_date']}")
+        r.check(f"{tag} confidence", row["terminal_event_confidence"] == "high", "")
+        r.check(f"{tag} days_missing", row["days_with_missing_forward_bars"] == max(cal - traded, 0),
+                f"eng={row['days_with_missing_forward_bars']} indep={max(cal-traded,0)}")
+        if last is not None:
+            r.check(f"{tag} last_valid_trade_date", row["last_valid_trade_date"] == last[0],
+                    f"eng={row['last_valid_trade_date']} indep={last[0]}")
+            ep = row["entry_price"]
+            if ep is not None:
+                r.check(f"{tag} terminal_event_return",
+                        close_enough(row["terminal_event_return"], last[1] / ep - 1.0),
+                        f"eng={row['terminal_event_return']} indep={last[1]/ep-1.0}")
 
 
 # ---------------------------------------------------------------------------
@@ -2372,6 +2486,7 @@ def main():
         classification_checks(d, obs, jr, colls, ref_idx, shares_map, praw)
         forward_outcomes_checks(d)
         forward_multiday_checks(d)
+        forward_terminal_checks(d)
         forward_path_checks(d)
 
     regime_checks(days_all)

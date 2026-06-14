@@ -141,6 +141,37 @@ pub struct ForwardInput<'a> {
     /// (B5) Pin-adjusted cash dividends with ex-date in (D, …], sorted by
     /// ex-date, for `ret_<H>_total` + `dividend_ex_date_within_<H>`.
     pub dividends_fwd: &'a [(NaiveDate, f64)],
+    /// (B5b) Terminal-event detection for this (security, day D). Computed in
+    /// the bin (needs the delisting lookup + calendar); the engine just emits
+    /// it and derives `terminal_event_return` per entry price.
+    pub terminal: TerminalInfo,
+}
+
+/// (B5b) Per-(security, day D) terminal-event info. `event_type` is `"none"`
+/// or `"delisted_unknown"` — no delisting REASON is on disk (build-state §8),
+/// so merger/bankruptcy are never claimed.
+#[derive(Clone, Copy)]
+pub struct TerminalInfo {
+    pub event_type: &'static str,
+    pub date: Option<NaiveDate>,
+    /// Last pin-adjusted close on/before the terminal date (for the return).
+    pub last_valid_close: Option<f64>,
+    pub last_valid_trade_date: Option<NaiveDate>,
+    pub days_with_missing_forward_bars: Option<i32>,
+    pub confidence: Option<&'static str>,
+}
+
+impl Default for TerminalInfo {
+    fn default() -> Self {
+        TerminalInfo {
+            event_type: "none",
+            date: None,
+            last_valid_close: None,
+            last_valid_trade_date: None,
+            days_with_missing_forward_bars: None,
+            confidence: None,
+        }
+    }
 }
 
 /// One security's pin-adjusted daily aggregate (RTH) for a forward day.
@@ -217,6 +248,9 @@ struct EntryRow {
     multiday: Option<MultiDay>,
     // (B5) bar_gap_minutes_max per the 13 horizons (None for blank rows)
     bar_gap: Vec<Option<i32>>,
+    // (B5b) terminal events (sid-level info + per-offset return)
+    terminal: TerminalInfo,
+    terminal_return: Option<f64>,
 }
 
 /// Parse an offset label like "0935" or "1530" into ET (hour, minute).
@@ -786,11 +820,24 @@ pub fn build(day: NaiveDate, inputs: &[ForwardInput<'_>]) -> Result<RecordBatch,
     }
 
     // Target-before-stop: hit_<pair> (bool) + first_event_<pair> (dict).
-    // 8 of 9 pairs filled in B3; the 21d pair stays null (B5).
+    // Pairs 0–7 (≤5d) from the 1m tape (B3); pair 8 (the 21d pair) from the
+    // daily multiday resolution (B5b).
+    let last_pair = TARGET_STOP_PAIRS_V6.len() - 1;
     for (pi, pair) in TARGET_STOP_PAIRS_V6.iter().enumerate() {
-        fill.insert(leak(format!("hit_{pair}")), Arc::new(rows.iter().map(|r| r.cross.as_ref().and_then(|c| c.hit[pi])).collect::<BooleanArray>()) as ArrayRef);
-        let ev: DictionaryArray<Int32Type> = rows.iter().map(|r| r.cross.as_ref().and_then(|c| c.first_event[pi])).collect();
-        fill.insert(leak(format!("first_event_{pair}")), Arc::new(ev) as ArrayRef);
+        let (hit, ev): (Vec<Option<bool>>, Vec<Option<&str>>) = if pi == last_pair {
+            (
+                rows.iter().map(|r| r.multiday.as_ref().and_then(|m| m.label21_hit)).collect(),
+                rows.iter().map(|r| r.multiday.as_ref().and_then(|m| m.label21_event)).collect(),
+            )
+        } else {
+            (
+                rows.iter().map(|r| r.cross.as_ref().and_then(|c| c.hit[pi])).collect(),
+                rows.iter().map(|r| r.cross.as_ref().and_then(|c| c.first_event[pi])).collect(),
+            )
+        };
+        fill.insert(leak(format!("hit_{pair}")), Arc::new(BooleanArray::from(hit)) as ArrayRef);
+        let evd: DictionaryArray<Int32Type> = ev.into_iter().collect();
+        fill.insert(leak(format!("first_event_{pair}")), Arc::new(evd) as ArrayRef);
     }
 
     // Day-0 segments / shape, time-underwater, next-day, gap-vs-RTH (Aux).
@@ -868,6 +915,19 @@ pub fn build(day: NaiveDate, inputs: &[ForwardInput<'_>]) -> Result<RecordBatch,
         fill.insert(leak(format!("ret_{label}_total")), Arc::new(rows.iter().map(|r| r.multiday.as_ref().and_then(|m| m.ret_total[hi])).collect::<Float64Array>()) as ArrayRef);
         fill.insert(leak(format!("dividend_ex_date_within_{label}")), Arc::new(rows.iter().map(|r| r.multiday.as_ref().and_then(|m| m.div_ex[hi])).collect::<BooleanArray>()) as ArrayRef);
     }
+    // (B5b) DAILY threshold crossings for the 5 long horizons.
+    for (hi, (label, _)) in LONG_HORIZONS.iter().enumerate() {
+        for (ti, t) in PCT_THRESHOLDS_V2.iter().enumerate() {
+            let p = hi * np * 2 + ti * 2;
+            fill.insert(leak(format!("first_cross_up_{t}pct_{label}")), Arc::new(rows.iter().map(|r| r.multiday.as_ref().and_then(|m| m.long_pct[p])).collect::<UInt32Array>()) as ArrayRef);
+            fill.insert(leak(format!("first_cross_down_{t}pct_{label}")), Arc::new(rows.iter().map(|r| r.multiday.as_ref().and_then(|m| m.long_pct[p + 1])).collect::<UInt32Array>()) as ArrayRef);
+        }
+        for (ti, t) in ATR_THRESHOLDS_V2.iter().enumerate() {
+            let p = hi * na * 2 + ti * 2;
+            fill.insert(leak(format!("first_cross_up_{t}atr_{label}")), Arc::new(rows.iter().map(|r| r.multiday.as_ref().and_then(|m| m.long_atr[p])).collect::<UInt32Array>()) as ArrayRef);
+            fill.insert(leak(format!("first_cross_down_{t}atr_{label}")), Arc::new(rows.iter().map(|r| r.multiday.as_ref().and_then(|m| m.long_atr[p + 1])).collect::<UInt32Array>()) as ArrayRef);
+        }
+    }
     // bar_gap_minutes_max_<H> for all 13 horizons (short from 1m tape; long null)
     for (hi, label) in FORWARD_HORIZONS_V2.iter().enumerate() {
         fill.insert(leak(format!("bar_gap_minutes_max_{label}")), Arc::new(rows.iter().map(|r| r.bar_gap.get(hi).copied().flatten()).collect::<Int32Array>()) as ArrayRef);
@@ -896,6 +956,16 @@ pub fn build(day: NaiveDate, inputs: &[ForwardInput<'_>]) -> Result<RecordBatch,
     fill.insert("pre_entry_ret_rank_today", Arc::new(Int32Array::from(pe_ret_rank)) as ArrayRef);
     fill.insert("pre_entry_ret_percentile_today", Arc::new(Float64Array::from(pe_ret_pct)) as ArrayRef);
     fill.insert("pre_entry_dollar_volume_rank_today", Arc::new(Int32Array::from(pe_dv_rank)) as ArrayRef);
+
+    // (B5b) terminal events.
+    let tt: DictionaryArray<Int32Type> = rows.iter().map(|r| Some(r.terminal.event_type)).collect();
+    fill.insert("terminal_event_type", Arc::new(tt) as ArrayRef);
+    let tc: DictionaryArray<Int32Type> = rows.iter().map(|r| r.terminal.confidence).collect();
+    fill.insert("terminal_event_confidence", Arc::new(tc) as ArrayRef);
+    fill.insert("terminal_event_date", Arc::new(rows.iter().map(|r| r.terminal.date.map(date32)).collect::<Date32Array>()) as ArrayRef);
+    fill.insert("last_valid_trade_date", Arc::new(rows.iter().map(|r| r.terminal.last_valid_trade_date.map(date32)).collect::<Date32Array>()) as ArrayRef);
+    fill.insert("terminal_event_return", Arc::new(rows.iter().map(|r| r.terminal_return).collect::<Float64Array>()) as ArrayRef);
+    fill.insert("days_with_missing_forward_bars", Arc::new(rows.iter().map(|r| r.terminal.days_with_missing_forward_bars).collect::<Int32Array>()) as ArrayRef);
 
     // Build the batch in schema order; anything not in `fill` is a typed null.
     for field in schema.fields() {
@@ -971,6 +1041,8 @@ fn resolve_entry(
         cum_dollar_volume_to_entry: None,
         multiday: None,
         bar_gap: vec![None; FORWARD_HORIZONS_V2.len()],
+        terminal: TerminalInfo::default(),
+        terminal_return: None,
     };
     let d0 = match inp.days.first() {
         Some(d) if !d.rth_bars.is_empty() => d,
@@ -1024,7 +1096,7 @@ fn resolve_entry(
     let aux = compute_aux(day, inp, eidx, entry_price, &tape, &ends);
     // ---- B5: multi-day horizons + ret_total + dividend flags + bar_gap ----
     let (d0_hi, d0_lo, d0_c) = day0_extremes(&tape, bounds[0]);
-    let multiday = compute_multiday(entry_price, d0_hi, d0_lo, d0_c, inp.forward_daily, inp.dividends_fwd);
+    let multiday = compute_multiday(entry_price, ctx.atr_14d, d0_hi, d0_lo, d0_c, inp.forward_daily, inp.dividends_fwd);
     let bar_gap = compute_bar_gap(&tape, &ends, &bounds);
     let excess: Vec<[Option<f64>; 3]> = horizons
         .iter()
@@ -1080,6 +1152,8 @@ fn resolve_entry(
         cum_dollar_volume_to_entry,
         multiday: Some(multiday),
         bar_gap,
+        terminal: inp.terminal,
+        terminal_return: inp.terminal.last_valid_close.map(|c| c / entry_price - 1.0),
     }
 }
 
@@ -1175,10 +1249,46 @@ struct MultiDay {
     stats: Vec<HorizonStat>,      // per LONG_HORIZONS (5); excess computed in build()
     ret_total: Vec<Option<f64>>,  // per MULTIDAY_DAYS (9)
     div_ex: Vec<Option<bool>>,    // per MULTIDAY_DAYS (9)
+    // (B5b) DAILY-resolution threshold crossings for the 5 long horizons.
+    // 1-based DAY index (day 0 = entry-day intraday extreme → 1; D+k → k+1);
+    // 0 = horizon reached, never crossed; null = horizon truncated. ATR null
+    // without atr_14d. Laid out [up, down] per (long-horizon, threshold).
+    long_pct: Vec<Option<u32>>,   // 5 × 7 × 2
+    long_atr: Vec<Option<u32>>,   // 5 × 6 × 2
+    // (B5b) the 21d target-before-stop pair (3atr before −1.5atr, 21d, daily).
+    label21_event: Option<&'static str>,
+    label21_hit: Option<bool>,
+}
+
+/// First DAY index (0-based: 0 = entry-day intraday, k = D+k) at which the
+/// daily series first satisfies `pred`, over `[day0, forward_daily]`.
+fn first_daily_cross(
+    day0: f64,
+    series: &[DailyBar],
+    field: impl Fn(&DailyBar) -> f64,
+    day0_val: f64,
+    pred: impl Fn(f64) -> bool,
+) -> Option<usize> {
+    let _ = day0;
+    if pred(day0_val) {
+        return Some(0);
+    }
+    series.iter().position(|db| pred(field(db))).map(|i| i + 1)
+}
+
+fn report_daily(first: Option<usize>, h: usize, have: bool) -> Option<u32> {
+    if !have {
+        return None; // horizon truncated (forward_daily < H)
+    }
+    match first {
+        Some(idx) if idx <= h => Some(idx as u32 + 1), // 1-based; day0 → 1
+        _ => Some(0),
+    }
 }
 
 fn compute_multiday(
     entry: f64,
+    atr_14d: Option<f64>,
     day0_high: f64,
     day0_low: f64,
     day0_close: f64,
@@ -1234,7 +1344,79 @@ fn compute_multiday(
         div_ex.push(Some(any));
     }
 
-    MultiDay { stats, ret_total, div_ex }
+    // ---- (B5b) daily threshold crossings for the 5 long horizons ----
+    let a14 = atr_14d.filter(|a| *a > 0.0);
+    let cross_day = |up_thr: f64, dn_thr: f64| -> (Option<usize>, Option<usize>) {
+        let up = first_daily_cross(day0_high, forward_daily, |db| db.high, day0_high, |x| x >= up_thr);
+        let dn = first_daily_cross(day0_low, forward_daily, |db| db.low, day0_low, |x| x <= dn_thr);
+        (up, dn)
+    };
+    let mut long_pct = Vec::with_capacity(LONG_HORIZONS.len() * PCT_THRESHOLDS_V2.len() * 2);
+    let mut long_atr = Vec::with_capacity(LONG_HORIZONS.len() * ATR_THRESHOLDS_V2.len() * 2);
+    // precompute first-cross day index per threshold (global over forward_daily)
+    let pct_cross: Vec<(Option<usize>, Option<usize>)> = PCT_THRESHOLDS_V2
+        .iter()
+        .map(|s| {
+            let v = pct_frac(s);
+            cross_day(entry * (1.0 + v), entry * (1.0 - v))
+        })
+        .collect();
+    let atr_cross: Vec<(Option<usize>, Option<usize>)> = ATR_THRESHOLDS_V2
+        .iter()
+        .map(|s| {
+            let m = atr_mult(s);
+            match a14 {
+                Some(a) => cross_day(entry + m * a, entry - m * a),
+                None => (None, None),
+            }
+        })
+        .collect();
+    for &(_, h) in LONG_HORIZONS {
+        let have = forward_daily.len() >= h;
+        for &(up, dn) in &pct_cross {
+            long_pct.push(report_daily(up, h, have));
+            long_pct.push(report_daily(dn, h, have));
+        }
+        for (ti, &(up, dn)) in atr_cross.iter().enumerate() {
+            let _ = ti;
+            if a14.is_none() {
+                long_atr.push(None);
+                long_atr.push(None);
+            } else {
+                long_atr.push(report_daily(up, h, have));
+                long_atr.push(report_daily(dn, h, have));
+            }
+        }
+    }
+
+    // ---- (B5b) the 21d target-before-stop pair: 3atr before −1.5atr ----
+    let (label21_event, label21_hit) = if forward_daily.len() < 21 || a14.is_none() {
+        ("no_data", None)
+    } else {
+        let a = a14.unwrap();
+        let (up, dn) = cross_day(entry + 3.0 * a, entry - 1.5 * a);
+        let up = up.filter(|&i| i <= 21);
+        let dn = dn.filter(|&i| i <= 21);
+        let ev = match (up, dn) {
+            (None, None) => "neither",
+            (Some(_), None) => "target_first",
+            (None, Some(_)) => "stop_first",
+            (Some(u), Some(d)) => {
+                if u < d { "target_first" } else { "stop_first" }
+            }
+        };
+        (ev, Some(ev == "target_first"))
+    };
+
+    MultiDay {
+        stats,
+        ret_total,
+        div_ex,
+        long_pct,
+        long_atr,
+        label21_event: Some(label21_event),
+        label21_hit,
+    }
 }
 
 /// (B5) `bar_gap_minutes_max_<H>` for the 13 horizons: largest intra-RTH
@@ -1285,6 +1467,7 @@ mod tests {
             entry_day_factor: 1.0,
             forward_daily: &[],
             dividends_fwd: &[],
+            terminal: Default::default(),
         };
         resolve_entry(days[0].day, &inp, off, &Default::default())
     }
@@ -1410,6 +1593,7 @@ mod tests {
             entry_day_factor: 1.0,
             forward_daily: &[],
             dividends_fwd: &[],
+            terminal: Default::default(),
         };
         let r = resolve_entry(day, &inp, "0935", &Default::default());
         assert_eq!(cross_atr(&r, "EOD", "1", false), Some(3));
@@ -1523,6 +1707,7 @@ mod tests {
             entry_day_factor: 1.0,
             forward_daily: &[],
             dividends_fwd: &[],
+            terminal: Default::default(),
         };
         // entry at 09:35 (idx0): RTH-through-entry = the entry bar only.
         let r = resolve_entry(day, &inp, "0935", &Default::default());
