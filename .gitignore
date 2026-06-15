@@ -8,8 +8,11 @@ Cargo.lock.bak
 .env.local
 .env.*.local
 
-# Cache root (per README §5.4)
+# Cache root (per README §5.4). `/data` also covers the case where data/ is a
+# symlink to external storage (e.g. the Samsung T7 at /mnt/atlas) — the
+# trailing-slash form matches only directories, not a symlink.
 data/
+/data
 
 # Python (validation scripts)
 __pycache__/

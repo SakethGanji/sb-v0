@@ -43,17 +43,27 @@ layer that consumes these tables).
 | B4 `forward_path_short` | ✅ **complete & L2-validated** (stamped `B4`) |
 | B5 multi-day horizons + dividends + terminal events | ✅ **complete** — `forward_outcomes` at all 657 cols |
 | B6a golden-day fixtures (split / ex-div / delisting / LULD halt / rename) | ✅ **complete & L2-validated** — `scripts/golden_days.py` + validator §N, 15/15 |
-| B6b **full 2016–2026 sweep** | ⬜ **NEXT** (the remaining B6 work) |
-| Independent validation battery | ✅ 85,553/85,553 on B1+B2+B3+B4+B5 + 15/15 golden |
+| B6b **full 2016–2026 sweep** | ✅ **complete & L2-validated** — all 8 tables, 2,513 days |
+| Independent validation battery | ✅ 158,033/158,033 (full corpus + stress regimes + 15/15 golden) |
 | Workspace tests | ✅ 139 passing |
 | Determinism + resume-equality | ✅ byte-identical (B1/B2) |
 
-**Important:** only **144 days (2016-06-08 → 2016-12-30)** have been swept so
-far — a smoke window for fast iteration. The full 2,513-day sweep is B6. **All
-eight tables now exist on disk for those 144 days, fully populated**
-(`forward_outcomes` 19.2M rows at all 657 cols; `forward_path_short` 433M rows
-/ ~16 GB). The only nulls in `forward_outcomes` are honest ones: `bar_gap` for
-10d+ (no 1m beyond D+5) and the terminal-detail columns for non-delisting names.
+**B6b complete (2026-06-15): the full 2,513-day corpus (2016-06-08 → 2026-06-05)
+is swept for all eight tables.** `forward_outcomes` = 2,513 day-files spanning
+the corpus (no partial/0-byte files); `daily_observation` matches at 2,513.
+`build-regimes` re-stamped thresholds against the true full exploration window.
+Honest nulls only: `bar_gap` for 10d+ (no 1m beyond D+5), terminal-detail for
+non-delisting names, and truncated long horizons for the last ~year of entries
+(252d forward runs past the 2026-06-05 corpus end). **Storage:** the dataset
+now lives on the Samsung T7 (`/mnt/atlas`, ext4); the repo's `data/` is a
+symlink there. forward_outcomes ~333 GB, forward_path_short ~280 GB.
+
+**Stage 3 validation (158,033 checks, 0 fail):** per-day exact recompute on the
+stress regimes the smoke window never covered — the 2020-03 COVID
+circuit-breaker week (03-09/16/18), the AAPL 2020-08-31 split straddle, and the
+FB→META 2022-06-09 rename — plus full-corpus property sweeps over all 2,513 days
+(daily_observation, forward_outcomes, forward_path_short) and the 15/15 golden
+battery. The smoke-window coverage gap is closed.
 
 All work through B5+validation is committed and clean. The only uncommitted
 files are `predmarket-*.md` (a different project — leave them).
@@ -419,14 +429,19 @@ fix (see §6: null bar-sid → FIGI backfill). Result: 4 corporate-action types
 were already correct on real 2020 stress data; the 5th exposed a real gap, now
 fixed.
 
-### B6b — full 2016–2026 sweep (NEXT)
+### B6b — full 2016–2026 sweep (DONE 2026-06-15)
 
-The **full 2,513-day sweep** (all 8 tables). The forward pass reads ~252 days
-past `to` for the daily matrix; for the full run, source the daily matrix from
-`daily_observation` (corpus-wide) rather than re-reading raw bars. Re-run
-`build-regimes` afterward so thresholds reflect the true exploration window.
-Re-run the full validation battery on stress regimes (a halt day, the rename
-day, the split day, a 2020 COVID week) to close the smoke-window coverage gap.
+The **full 2,513-day sweep** of all 8 tables is complete (write-phase0 → forward
+sweep, chunked by year → build-regimes). Validation: 158,033/158,033 on the
+stress regimes + full-corpus property sweeps + golden (see §1). The forward
+pass still re-reads raw bars for the daily matrix (the `daily_observation`
+source optimization was not needed — yearly chunks bounded the in-RAM matrix
+and the run fit in ~13 h). Operational artifacts: `scripts/_b6b_resume.sh` /
+`_b6b_resume2.sh` (chunked, disk-guarded, resumable — they survived a mid-run
+machine crash with zero data loss; one 0-byte partial was the only casualty).
+
+**Phase 0 engine is now complete: all 8 tables, full corpus, every layer
+validated.** Remaining work is Phase 1 (the analytical layer), not engine.
 
 ---
 
