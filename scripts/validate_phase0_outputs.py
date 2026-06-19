@@ -32,9 +32,10 @@ Usage: scripts/validate_phase0_outputs.py [DAY ...]
        (default battery: 2016-12-30 2016-11-25 2016-11-07 2016-06-09)
 """
 
+import collections
 import math
 import sys
-from datetime import date, time
+from datetime import date, time, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -2229,6 +2230,31 @@ def forward_multiday_checks(d):
                     and row["terminal_event_return"] is None, f"type={row['terminal_event_type']}")
 
 
+_DELISTED_MEMBER = None
+
+
+def _delisted_membership():
+    """For every delisted sid, the corpus-day indices on which it trades (per
+    daily_observation). Authoritative continuation signal: a `delisted_utc`
+    that the sid keeps trading past is not a real delisting (rename, spin-off,
+    or a stale vendor date) — mirrors the engine's "any bar after dl" check."""
+    global _DELISTED_MEMBER
+    if _DELISTED_MEMBER is None:
+        te = pl.read_parquet(REF / "tickers_enriched.parquet",
+                             columns=["security_id", "delisted_utc"]).filter(pl.col("delisted_utc").is_not_null())
+        delisted = set(te["security_id"].drop_nulls().to_list())
+        corpus = corpus_trading_days()
+        cidx = {d: i for i, d in enumerate(corpus)}
+        mem = collections.defaultdict(list)
+        for d in corpus:
+            s = pl.read_parquet(OUT / "daily_observation" / f"{d}.parquet", columns=["security_id"])["security_id"]
+            i = cidx[d]
+            for sid in set(s.to_list()) & delisted:
+                mem[sid].append(i)
+        _DELISTED_MEMBER = (mem, corpus, cidx)
+    return _DELISTED_MEMBER
+
+
 def forward_terminal_checks(d, n_check=3):
     """Verify terminal-event detection on real delisting securities."""
     fo_path = OUT / "forward_outcomes" / f"{d}.parquet"
@@ -2252,10 +2278,28 @@ def forward_terminal_checks(d, n_check=3):
     cands = [(r["security_id"], r["display_symbol_on_day"]) for r in do.iter_rows(named=True)
              if r["security_id"] in dlmap and d < dlmap[r["security_id"]] <= horizon][:n_check]
     eng = pl.read_parquet(fo_path)
+    mem, corpus_d, cidx = _delisted_membership()
     sp_all, pin = _fo_splits()
     for sid, sym in cands:
         dl = dlmap[sid]
-        # this security's traded (date, adj close) for d+1.. up to dl
+        rw = eng.filter((pl.col("security_id") == sid) & (pl.col("entry_offset") == "1000"))
+        if rw.height != 1:
+            continue
+        row = rw.to_dicts()[0]
+        tag = f"{d} {sym}(delist {dl})"
+        # `delisted_utc` also fires on renames / spin-offs / stale dates. The
+        # authoritative test (matching the engine): does the sid keep trading
+        # AFTER dl, within the ~252-trading-day matrix window? If so it did not
+        # delist (e.g. ABIO→ORKA rename; AAN restructure) and the engine
+        # suppresses the event — so must we. A FIGI reused by an unrelated
+        # security only reappears months/years later, outside the window.
+        dli = cidx.get(dl, sum(1 for x in corpus_d if x <= dl) - 1)
+        continues = any(dli < x <= dli + 252 for x in mem.get(sid, []))
+        if continues:
+            r.check(f"{tag} no terminal event (sid trades past delist)",
+                    row["terminal_event_type"] in (None, "none"), f"={row['terminal_event_type']}")
+            continue
+        # true delisting — exact recompute of the terminal detail
         series = []
         k = corpus.index(d) + 1
         while k < len(corpus) and corpus[k] <= dl:
@@ -2267,11 +2311,6 @@ def forward_terminal_checks(d, n_check=3):
         window_end = min(dl, matrix_end)
         traded = sum(1 for dt_, _ in series if dt_ <= window_end)
         cal = sum(1 for x in corpus if d < x <= window_end)
-        rw = eng.filter((pl.col("security_id") == sid) & (pl.col("entry_offset") == "1000"))
-        if rw.height != 1:
-            continue
-        row = rw.to_dicts()[0]
-        tag = f"{d} {sym}(delist {dl})"
         r.check(f"{tag} type", row["terminal_event_type"] == "delisted_unknown", f"={row['terminal_event_type']}")
         r.check(f"{tag} date", row["terminal_event_date"] == dl, f"={row['terminal_event_date']}")
         r.check(f"{tag} confidence", row["terminal_event_confidence"] == "high", "")
@@ -2691,6 +2730,7 @@ def golden_checks():
 def main():
     argv = sys.argv[1:]
     run_golden = "--golden" in argv
+    no_sweep = "--no-sweep" in argv   # skip the corpus-wide sweeps (already run); per-day exact battery only
     golden_only = run_golden and len(argv) == 1
     day_args = [a for a in argv if not a.startswith("--")]
 
@@ -2755,10 +2795,14 @@ def main():
         forward_terminal_checks(d)
         forward_path_checks(d)
 
-    regime_checks(days_all)
-    property_sweep(days_all)
-    forward_property_sweep(days_all)
-    forward_path_property_sweep(days_all)
+    if no_sweep:
+        print(f"\n{'='*64}\n[--no-sweep] corpus-wide sweeps skipped (regime + property sweeps); "
+              f"per-day exact recompute on {len(battery)} days only")
+    else:
+        regime_checks(days_all)
+        property_sweep(days_all)
+        forward_property_sweep(days_all)
+        forward_path_property_sweep(days_all)
     if run_golden:
         golden_checks()
 

@@ -64,6 +64,7 @@ struct Args {
     out: PathBuf,
     cursor: PathBuf,
     force: bool,
+    no_path: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -75,6 +76,7 @@ fn parse_args() -> Result<Args> {
         out: PathBuf::from("data/outputs"),
         cursor: PathBuf::from("data/_engine_state.sqlite"),
         force: false,
+        no_path: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -92,6 +94,7 @@ fn parse_args() -> Result<Args> {
             "--out" => args.out = PathBuf::from(val("--out")?),
             "--cursor" => args.cursor = PathBuf::from(val("--cursor")?),
             "--force" => args.force = true,
+            "--no-path" => args.no_path = true,
             other => bail!("unknown arg: {other}"),
         }
     }
@@ -306,6 +309,17 @@ fn compute_terminal(
         return TerminalInfo::default();
     }
     let series = matrix.get(sid).map(Vec::as_slice).unwrap_or(&[]);
+    // `tickers_enriched.delisted_utc` also fires on a ticker RENAME (the old
+    // symbol's cessation), not just a true delisting. Post the FIGI-identity
+    // fix the matrix correctly follows the security across the rename under one
+    // sid (e.g. ABIO→ORKA, AGFY→RYM), so it keeps trading past `dl`. If the sid
+    // has ANY bar after `dl`, it did not delist — suppress the spurious
+    // terminal event. (A true delisting has no bars after `dl`; FIGI reuse by
+    // an unrelated security happens months/years later, outside the ≤252-day
+    // matrix window, so it cannot false-trigger here.)
+    if series.iter().any(|d| d.day > dl) {
+        return TerminalInfo::default();
+    }
     let last = series.iter().rev().find(|d| d.day <= dl);
     let window_end = dl.min(matrix_end);
     let traded = series.iter().filter(|d| d.day > day && d.day <= window_end).count() as i32;
@@ -365,6 +379,7 @@ fn emit_day(
     delisted: &HashMap<String, NaiveDate>,
     all_days: &[NaiveDate],
     matrix_end: NaiveDate,
+    write_path: bool,
 ) -> Result<(usize, usize)> {
     let d0 = &buf[0];
     let day = d0.day;
@@ -407,9 +422,16 @@ fn emit_day(
     let fo_rows = fo.num_rows();
     write_table(fwd_dir, day, forward_outcomes_schema(), &fo, &stamps::forward_outcomes_stamps(), FWD_MILESTONE)?;
 
-    let fp = forward_path::build(day, &inputs)?;
-    let fp_rows = fp.num_rows();
-    write_table(path_dir, day, forward_path_short_schema(), &fp, &stamps::forward_path_short_stamps(), FP_MILESTONE)?;
+    // --no-path: skip forward_path_short (unchanged by terminal-event fixes;
+    // its existing files stay valid). Halves a terminal-only re-sweep.
+    let fp_rows = if write_path {
+        let fp = forward_path::build(day, &inputs)?;
+        let n = fp.num_rows();
+        write_table(path_dir, day, forward_path_short_schema(), &fp, &stamps::forward_path_short_stamps(), FP_MILESTONE)?;
+        n
+    } else {
+        0
+    };
 
     Ok((fo_rows, fp_rows))
 }
@@ -507,7 +529,7 @@ fn main() -> Result<()> {
             skipped += 1;
             return Ok(());
         }
-        let (fo, fp) = emit_day(buf, &args.out, &fwd_dir, &path_dir, &matrix, &dividends, &delisted, &all_days, matrix_end)?;
+        let (fo, fp) = emit_day(buf, &args.out, &fwd_dir, &path_dir, &matrix, &dividends, &delisted, &all_days, matrix_end, !args.no_path)?;
         cursor.mark_done(FWD_TABLE, day)?;
         cursor.mark_done(FWD_PATH_TABLE, day)?;
         written += 1;

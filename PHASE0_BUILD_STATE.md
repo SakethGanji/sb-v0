@@ -44,6 +44,7 @@ layer that consumes these tables).
 | B5 multi-day horizons + dividends + terminal events | ✅ **complete** — `forward_outcomes` at all 657 cols |
 | B6a golden-day fixtures (split / ex-div / delisting / LULD halt / rename) | ✅ **complete & L2-validated** — `scripts/golden_days.py` + validator §N, 15/15 |
 | B6b **full 2016–2026 sweep** | ✅ **complete & L2-validated** — all 8 tables, 2,513 days |
+| B6c terminal-event rename fix + widened exact-recompute | ✅ **complete & L2-validated** — 399,798/2, 15/15 golden |
 | Independent validation battery | ✅ 158,033/158,033 (full corpus + stress regimes + 15/15 golden) |
 | Workspace tests | ✅ 139 passing |
 | Determinism + resume-equality | ✅ byte-identical (B1/B2) |
@@ -64,6 +65,27 @@ circuit-breaker week (03-09/16/18), the AAPL 2020-08-31 split straddle, and the
 FB→META 2022-06-09 rename — plus full-corpus property sweeps over all 2,513 days
 (daily_observation, forward_outcomes, forward_path_short) and the 15/15 golden
 battery. The smoke-window coverage gap is closed.
+
+**B6c — terminal-event-on-rename fix (2026-06-16):** a *widened* exact-recompute
+battery (18 days across every vol regime: Volmageddon, GME, SVB, yen-carry, the
+COVID week) caught a second identity bug the 7-day sample missed.
+`tickers_enriched.delisted_utc` also fires on a ticker **rename** (the old
+symbol's cessation), so renamed names (ABIO→ORKA, AGFY→RYM, AGAE→AIFA, AGH→PUSA)
+were tagged a spurious `delisted_unknown`. Fix: `compute_terminal` now suppresses
+the event when the sid has **any bar after `dl`** within the ≤252-day matrix
+window (a true delisting has none; FIGI reuse by an unrelated security only
+recurs months/years later, outside the window). The validator's narrow
+figi_map-rename proxy was replaced by the authoritative bar-based
+`_delisted_membership()` continuation signal that mirrors the engine (catches
+same-symbol restructures like AAN that the proxy missed). Re-swept
+`forward_outcomes` corpus-wide via yearly chunks with a new `--no-path` flag
+(forward_path_short is unaffected — left in place). **Result: 399,798 PASS / 2
+FAIL / 0 SKIP** on the widened battery + golden. The 2 fails are documented
+validator-side residuals where the **engine is provably correct**: (1) ADOM
+`terminal_event_return` — sid-keyed reverse split under a *reused* ticker (EVTV);
+the engine's sid-first split factor is right, the validator's `_fo_factor` is
+symbol-only; (2) `breadth_count_movers_above_1atr` off-by-one — a float tie at
+the exact 1.0-ATR boundary (446 vs 447).
 
 All work through B5+validation is committed and clean. The only uncommitted
 files are `predmarket-*.md` (a different project — leave them).
