@@ -1530,10 +1530,14 @@ def _fo_adj_rth(daybars, close_t, sym, factor):
     return out
 
 
-def _fo_resolve(per_day_bars, off, atr14=None, pm_vol=0.0, pm_dollar=0.0):
+def _fo_resolve(per_day_bars, off, atr14=None, pm_vol=0.0, pm_dollar=0.0,
+                adv20=None, addv20=None, yz14=None):
     """per_day_bars[k] = adjusted RTH bar list for D+k (k=0..5). Returns a
     dict of recomputed columns for one entry_offset, or None if no entry.
-    pm_vol/pm_dollar = adjusted premarket volume/dollar for D (04:00-09:30)."""
+    pm_vol/pm_dollar = adjusted premarket volume/dollar for D (04:00-09:30).
+    adv20/addv20/yz14 = daily_observation[D] adv_20d / addv_20d /
+    yang_zhang_vol_14d for the security (denominators for entry-quality
+    proxies)."""
     d0 = per_day_bars[0]
     if not d0:
         return None
@@ -1735,7 +1739,22 @@ def _fo_resolve(per_day_bars, off, atr14=None, pm_vol=0.0, pm_dollar=0.0):
 
     pre = d0[:eidx]
     pre_vol = sum(b[5] for b in pre)
+    pre_dollar = sum(b[4] * b[5] for b in pre)
     pre_high = max((b[2] for b in pre), default=None)
+    pre_low = min((b[3] for b in pre), default=None)
+    has_pre = bool(pre)
+    # Tie-breaking mirrors Rust exactly: `max_by` returns the LAST maximal
+    # element (minutes_since_high), `min_by` returns the FIRST minimal element
+    # (minutes_since_low). pre indices are d0 indices, so eidx-i is the
+    # bar-count distance the engine uses (`(eidx - i) as i32`).
+    if has_pre:
+        high_at = max(i for i, b in enumerate(pre) if b[2] == pre_high)
+        low_at = min(i for i, b in enumerate(pre) if b[3] == pre_low)
+    else:
+        high_at = low_at = None
+    o_e, h_e, l_e, c_e, v_e = ebar[1], ebar[2], ebar[3], ebar[4], ebar[5]
+    rng_e = h_e - l_e
+    dollar_1m = c_e * v_e
     return {
         "entry_price": ep,
         "is_halted_at_entry": ebar[0] > entry_min,
@@ -1749,6 +1768,23 @@ def _fo_resolve(per_day_bars, off, atr14=None, pm_vol=0.0, pm_dollar=0.0):
             (ebar[4] - ebar[3]) / (ebar[2] - ebar[3]) if ebar[2] > ebar[3] else None
         ),
         "entry_open_to_close_1m_return": ebar[4] / ebar[1] - 1.0 if ebar[1] > 0 else None,
+        # --- 15 entry-microstructure columns (independent recompute; engine
+        # resolve_entry forward_outcomes.rs:1073-1155). entry_price == o_e. ---
+        "pre_entry_vwap_from_open": (pre_dollar / pre_vol) if pre_vol > 0 else None,
+        "pre_entry_low_return_so_far": (pre_low / rth_open - 1.0) if has_pre else None,
+        "pre_entry_minutes_since_high": (eidx - high_at) if has_pre else None,
+        "pre_entry_minutes_since_low": (eidx - low_at) if has_pre else None,
+        "pre_entry_ret_from_high": (ep / pre_high - 1.0) if has_pre else None,
+        "pre_entry_ret_from_low": (ep / pre_low - 1.0) if has_pre else None,
+        "entry_bar_upper_wick_pct": ((h_e - max(o_e, c_e)) / o_e) if o_e > 0 else None,
+        "entry_bar_lower_wick_pct": ((min(o_e, c_e) - l_e) / o_e) if o_e > 0 else None,
+        "entry_slippage_proxy_bps": ((rng_e / 2.0) / ep * 1e4) if ep > 0 else None,
+        "entry_participation_capacity_1pct_adv": (0.01 * adv20 * ep) if adv20 is not None else None,
+        "entry_participation_capacity_5pct_1m_volume": 0.05 * dollar_1m,
+        "entry_1m_dollar_volume": dollar_1m,
+        "entry_range_vs_atr_14d": (rng_e / atr14) if (atr14 is not None and atr14 > 0) else None,
+        "entry_range_vs_yz_vol_14d": (rng_e / yz14) if (yz14 is not None and yz14 > 0) else None,
+        "entry_dollar_volume_vs_addv_20d": (dollar_1m / addv20) if (addv20 is not None and addv20 > 0) else None,
         "horizons": horizons,
         "cross": cross,
         "labels": labels,
@@ -1779,14 +1815,18 @@ def forward_outcomes_checks(d):
 
     do = pl.read_parquet(
         OUT / "daily_observation" / f"{d}.parquet",
-        columns=["security_id", "display_symbol_on_day", "atr_14d"],
+        columns=["security_id", "display_symbol_on_day", "atr_14d",
+                 "adv_20d", "addv_20d", "yang_zhang_vol_14d"],
     )
     sym2sid = {}
     sym2atr = {}
+    sym2ctx = {}  # (adv_20d, addv_20d, yang_zhang_vol_14d) for entry-quality denominators
     for row in do.iter_rows(named=True):
         if row["display_symbol_on_day"] in SAMPLE:
             sym2sid[row["display_symbol_on_day"]] = row["security_id"]
             sym2atr[row["display_symbol_on_day"]] = row["atr_14d"]
+            sym2ctx[row["display_symbol_on_day"]] = (
+                row["adv_20d"], row["addv_20d"], row["yang_zhang_vol_14d"])
     eng = pl.read_parquet(fo_path).filter(
         pl.col("security_id").is_in(list(sym2sid.values()))
     )
@@ -1822,9 +1862,11 @@ def forward_outcomes_checks(d):
 
     for sym, sid in sym2sid.items():
         f_d = _fo_factor(sp_all, pin, sym, d)
+        adv20, addv20, yz14 = sym2ctx.get(sym, (None, None, None))
         for off in FO_OFFSETS:
             pmv, pmd = sym_pm[sym]
-            exp = _fo_resolve(sym_bars[sym], off, sym2atr.get(sym), pmv, pmd)
+            exp = _fo_resolve(sym_bars[sym], off, sym2atr.get(sym), pmv, pmd,
+                              adv20, addv20, yz14)
             row = eng.filter((pl.col("security_id") == sid) & (pl.col("entry_offset") == off))
             if row.height != 1:
                 r.check(f"{d} {sym}@{off} row present", False, f"rows={row.height}")
@@ -1843,7 +1885,17 @@ def forward_outcomes_checks(d):
                     row["is_halted_at_entry"] == exp["is_halted_at_entry"], "")
             for col in ["pre_entry_ret_from_open", "pre_entry_volume_from_open",
                         "pre_entry_high_return_so_far", "entry_1m_volume", "entry_1m_range",
-                        "entry_price_location_in_1m_bar", "entry_open_to_close_1m_return"]:
+                        "entry_price_location_in_1m_bar", "entry_open_to_close_1m_return",
+                        # 15 entry-microstructure columns (independent recompute)
+                        "pre_entry_vwap_from_open", "pre_entry_low_return_so_far",
+                        "pre_entry_minutes_since_high", "pre_entry_minutes_since_low",
+                        "pre_entry_ret_from_high", "pre_entry_ret_from_low",
+                        "entry_bar_upper_wick_pct", "entry_bar_lower_wick_pct",
+                        "entry_slippage_proxy_bps",
+                        "entry_participation_capacity_1pct_adv",
+                        "entry_participation_capacity_5pct_1m_volume",
+                        "entry_1m_dollar_volume", "entry_range_vs_atr_14d",
+                        "entry_range_vs_yz_vol_14d", "entry_dollar_volume_vs_addv_20d"]:
                 r.check(f"{tag} {col}", close_enough(row[col], exp[col]),
                         f"eng={row[col]} indep={exp[col]}")
             for label, _, _ in FO_HORIZONS:

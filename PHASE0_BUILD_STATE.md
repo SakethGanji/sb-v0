@@ -87,6 +87,20 @@ the engine's sid-first split factor is right, the validator's `_fo_factor` is
 symbol-only; (2) `breadth_count_movers_above_1atr` off-by-one — a float tie at
 the exact 1.0-ATR boundary (446 vs 447).
 
+**B6c.1 — entry-microstructure coverage closure (2026-06-20):** the coverage
+audit had flagged 15 entry-quality columns as deterministic transforms of
+validated inputs but with *no* independent recompute. Closed: `_fo_resolve`
+now re-derives all 15 from the raw 1m tape + `daily_observation[D]`
+denominators (`adv_20d`/`addv_20d`/`yang_zhang_vol_14d`) — pre_entry
+vwap/low_return/ret_from_high/ret_from_low/minutes_since_high/minutes_since_low,
+entry-bar upper/lower wick, slippage-proxy-bps, both participation-capacity
+proxies, 1m dollar-volume, and the range-vs-atr/yz/addv ratios. Formulas were
+checked against the engine `resolve_entry` source (not a paraphrase), including
+the Rust tie-break asymmetry (`max_by`->last for `minutes_since_high`,
+`min_by`->first for `minutes_since_low`). Widened 18-day battery + golden now
+**406,188 PASS / 2 FAIL / 0 SKIP** (same 2 documented residuals). Every
+forward_outcomes column the audit could name now has independent recompute.
+
 All work through B5+validation is committed and clean. The only uncommitted
 files are `predmarket-*.md` (a different project — leave them).
 
