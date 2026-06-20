@@ -1376,6 +1376,19 @@ hurdle, every cell ranking, and every "is this tradeable" determination
 depends on it. §6.1 below proposes a data-driven derivation rather than
 leaving it as a guess.
 
+**RESOLVED 2026-06-20 (frozen Category-A cost-model constants):**
+- **Execution/commission:** **retail, ~0 commission** (spread proxy + sqrt-impact
+  only). This is the primary hurdle lens; an institutional per-share-commission
+  variant may be reported as a Category-B sensitivity row but does not gate.
+- **Spread-proxy calibration:** **skip for now — use the §6.1 high-low proxy with
+  the top-200-ADV cap, uncalibrated.** Revisit (SEC MIDAS benchmark or a
+  quotes-entitled month) only if a finding survives to pre-registration.
+- **Deployable capital per cell (review-queue ranking only):** **retail-scale,
+  ~$100k–1M.** Low-float micro-cap edges deprioritized in the edge×capacity
+  review queue since they can't absorb size. Does not gate findings.
+- Target Sharpe (0.5), max pre-registered hypotheses (20), and manual-review
+  budget remain per §1.6 / §2.8.
+
 - **Cost model** — see §6.1; derive data-driven from existing inputs.
 - **What's the target Sharpe?** 0.5 (rough hurdle), 1.0 (publishable), 1.5+
   (institutional). Different targets give very different cell counts.
