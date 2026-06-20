@@ -166,11 +166,15 @@ def main():
 
     res = pl.DataFrame(recs)
     rej = by_survivors(res["p_net_negative"].to_numpy())
-    res = res.with_columns(pl.Series("by_blacklisted", rej))
-    # tag robust (gross-negative too) vs cost-driven
+    rej_gross = by_survivors(res["p_gross_negative"].to_numpy())   # proper BY, not a loose threshold
+    res = res.with_columns(pl.Series("by_blacklisted", rej),
+                           pl.Series("gross_by_survivor", rej_gross))
+    # ROBUST = significantly negative GROSS under proper BY (cost-independent);
+    # COST-DRIVEN = net-significant only. (The placebo validated that proper BY
+    # on gross gives ~0 here — the loose α/H_m threshold over-counted.)
     res = res.with_columns(
         pl.when(~pl.col("by_blacklisted")).then(pl.lit(""))
-        .when(pl.col("p_gross_negative") <= ALPHA / Hm).then(pl.lit("ROBUST"))
+        .when(pl.col("gross_by_survivor")).then(pl.lit("ROBUST"))
         .otherwise(pl.lit("COST-DRIVEN")).alias("kind"))
 
     bl = res.filter(pl.col("by_blacklisted")).sort("mean_net")
@@ -192,15 +196,16 @@ def main():
     combined = struct_keys | by_keys
     print(f"\n[COMBINED] blacklist = {len(struct_keys)} structural ∪ {len(by_keys)} empirical "
           f"= {len(combined)} cells")
-    # robust-gross count across whole family (cost-independent signal)
-    rob_all = res.filter(pl.col("p_gross_negative") <= ALPHA / Hm).height
-    print(f"  (cost-independent: {rob_all}/{m} cells are gross-excess negative at the "
-          f"loose BY end — momentum bleed independent of the cost caveat)")
+    # robust-gross count across whole family (cost-independent, PROPER BY)
+    rob_all = int(res["gross_by_survivor"].sum())
+    print(f"  (cost-independent: {rob_all}/{m} cells survive proper-BY gross-negative "
+          f"— placebo-validated; momentum bleed independent of the cost caveat)")
 
     print(f"\nWALL: {(dt.datetime.now()-t0).total_seconds():.0f}s")
-    print("Interpretation: PART A is the durable, calibration-independent core. "
-          "PART B/ROBUST cells\nare genuine negative-momentum cohorts; COST-DRIVEN "
-          "cells flip with the liquid-cost\nupper bound and graduate only after §6.1 calibration.")
+    print("Interpretation: PART A (structural) is the durable operating blacklist. "
+          "Under proper\nBY, 0 cells are robustly gross-negative (placebo-validated) — so PART B's "
+          "survivors\nare all COST-DRIVEN: low-liquidity cells already in A, plus liquid cells that "
+          "flip\nwith the liquid-cost upper bound and graduate only after §6.1 calibration.")
 
 
 if __name__ == "__main__":
