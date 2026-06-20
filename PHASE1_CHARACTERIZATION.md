@@ -1,24 +1,42 @@
 # Phase 1 — Characterization (Cycle 1 Close)
 
-**Date:** 2026-06-20 · **Status:** CYCLE 1 COMPLETE. This is the standing record of
-what Phase 1 found. It consolidates the seven step-level findings docs (linked at
+**Date:** 2026-06-20 · **Status: CYCLE 1 CLOSED.** This is the standing record of
+what Phase 1 found. It consolidates the nine step-level findings docs (linked at
 the end) into one authoritative artifact, per `phase1-research-strategy.md` §1.7.
 
 ---
 
 ## 0. Verdict (plain words)
 
-**There is no deployable trading strategy in this data for the signals tested —
-and that conclusion is rigorously earned, not assumed.**
+**No deployable strategy in the tradeable universe — but the data is not empty:
+it holds real, era-stable cross-sectional factor structure that sits exactly where
+friction prevents its capture.** Both halves are rigorously earned, not assumed.
 
-Simple-to-moderate intraday/short-horizon rules ("buy morning strength," "buy the
-dip," gap/breakout/concentration plays, with/without stops and targets) do **not**
-produce a positive cost-adjusted, market-excess return on 2016–2020 US equities.
-What Phase 1 *did* produce: a durable **structural blacklist** (where not to trade),
-a **near-zero predictability ceiling** (the recorded features carry almost no
-information about forward outcomes), and a **fully validated engine + analysis
-pipeline**. This is the "characterized null" the plan named as a valid, and likely,
-endpoint (§1.4, §1.5.1) — not a failure of execution.
+- **Null where you can trade.** Simple-to-moderate rules ("buy morning strength,"
+  "buy the dip," gap/breakout/concentration, with/without stops/targets, 16 signals)
+  and path-dependent DP exits do **not** produce a positive cost-adjusted, market-
+  excess return on liquid/deployable 2016–2020 US equities. The cross-section of
+  deployable names is **efficient** (the factor scan finds no era-stable structure
+  there).
+- **Real-but-uncapturable structure where you can't.** A systematic cross-sectional
+  scan *did* find consistent, 5/5-era-stable structure — the classic **low-volatility
+  / size / liquidity factor family** — but it is **concentrated in small/micro-cap,
+  high-vol, illiquid names** (the blacklisted friction corner) and is a **long-short
+  factor** (capturing it needs shorting the high-vol leg, which is gated). It is
+  documented anomaly behavior, not novel alpha, and it is **behind glass**: friction
+  and the long-only constraint prevent harvesting it.
+
+Every result points the same way and is mutually consistent. What Phase 1 produced:
+a durable **structural blacklist**, a **near-zero predictability ceiling** in liquid
+names, a **map of where the real structure lives (and why it's uncapturable)**, and a
+**fully validated engine + analysis pipeline**. This is the "characterized null +
+characterization" the plan named as a valid, and likely, endpoint (§1.4, §1.5.1) —
+the project working as designed, not a failure of execution.
+
+**CYCLE 1 CLOSED — 2026-06-20.** A cycle 2 (§1.7) is permitted only with a written,
+specific justification — realistically that means new data (news/order-flow/options/
+fundamentals/borrow) or a long-short + small-cap-access mandate to attempt the factor,
+not more analysis of this data. Absent that, this characterization is the deliverable.
 
 ---
 
@@ -186,9 +204,10 @@ and treat the validated engine + blacklist as the deliverable.
 **Findings docs:** `phase1-power-mde-findings.md` · `phase1-tracer-findings.md` ·
 `phase1-cost-model-findings.md` · `phase1-blacklist-findings.md` ·
 `phase1-validation-findings.md` · `phase1-ceiling-findings.md` ·
-`phase1-stability-findings.md` · `phase1-sweep-findings.md`
+`phase1-stability-findings.md` · `phase1-sweep-findings.md` ·
+`phase1-dp-findings.md` · `phase1-factor-findings.md`
 **Scripts:** `scripts/phase1_{power_mde_pass,tracer_bullet,cost_model,verify,
-blacklist,placebo,synthetic,ceiling,stability,sweep}.py`
+blacklist,placebo,synthetic,ceiling,stability,sweep,dp,factor_scan,factor_verify}.py`
 **Plan:** `phase1-research-strategy.md` (frozen) · **Session handoff:**
 `PHASE1_SESSION_2026-06-20.md`
 **Analysis outputs:** `data/phase1_analysis/*.parquet` (T7)
