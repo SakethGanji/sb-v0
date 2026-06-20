@@ -126,11 +126,16 @@ The three coincide: analytic MDE ↔ false-positive control ↔ true-positive po
 
 ---
 
-## 6. The heavy stack was correctly NOT built
+## 6. The heavy stack — gated, and DP additionally tested directly
 
-- **DP / hierarchical Bayes (Stage C):** gated OUT — §7.8 step 4 runs DP only on
-  cells with a non-trivial predictability ceiling; none qualified (#2). Building it
-  would have been optimizing on noise.
+- **DP / optimal-stopping exits:** first gated by the ceiling, then **tested directly**
+  to close the gap (the ceiling measured pre-entry features; DP uses within-trade path
+  state — a different conditioning set). A **cross-fit DP exit policy** on 3
+  representative cells (`phase1-dp-findings.md`) adds **no significant out-of-sample
+  value** over a state-blind fixed-time exit (all DP−fixed lower bounds ≤ 0; the one
+  positive point estimate was an overfit mirage the cross-fit exposed). DP confirmed
+  as a result, not a gate.
+- **Hierarchical Bayes (Stage C):** gated out — nothing to pool (no positive cells).
 - **Phase 4 meta-labeling:** ruled out by the near-zero ceiling (#2).
 
 ---
