@@ -15,6 +15,16 @@ recording-gap additions from the schema audit (§3.6), v2 implementation
 checklist + audit-closing decisions (§3.6–§3.7). **Implementation starts
 from §3.7.**
 
+**Amended 2026-06-14 (exploratory-tier additions; no new ingest, no schema
+change, no primary-family multiplicity):** swing / multi-day (§1.3.21),
+short-side *pattern + avoid-filter* research (§1.3.22 — clarifies that the
+§1.6 long-only constant is *execution*-only, not a research-perspective
+limit), and setup-archetype clustering (§1.3.23 + method §7.4.1). All three
+sit in the §7.7.1 exploratory drill-down tier: hypothesis generators on
+coarse-cell survivors, never additions to the primary `(classification ×
+regime)` BY family. The schema is untouched — every column they use is
+already in Phase 0 v7.
+
 **Read after:** `momentum-hold-phase0-frozen-v2.md`, `phase0-observation-pivot-rfc.md`.
 
 ---
@@ -118,6 +128,14 @@ downstream readers refuse mismatched joins.
 The 13 original question categories + 6 additional ones I'd flag as worth
 asking. Each row points at the algorithmic layer that answers it (full
 algorithm explanation in §7).
+
+This section is the **frozen, curated** catalog. Its **living expansion** is
+`phase1-candidate-questions.md` — a ~135-question backlog, each row mapped to
+v7 columns + algorithm + tier (primary / exploratory) + executable/pattern/
+avoid tag + data-gap flag. The backlog churns freely; this §1.3 does not.
+Promotion rule: a backlog question becomes a §1.3.x entry only when it is
+about to enter a discovery run, so the frozen catalog stays small and the
+multiplicity ledger (§1.6) stays honest.
 
 **Notation:** *MI* = mutual information (Layer 1), *BN* = Bayesian network
 structure (Layer 2), *DP* = Bellman dynamic programming (Layer 3), *HB* =
@@ -292,6 +310,78 @@ meta-labeling.
 | Did the meme era (2020-2021) artificially inflate edges? | Era-conditional DP | V(meme_era) vs V(other_eras) |
 | When should we suspect the edge is dying? | Sequential change-point detection | Bayesian online change-point on V time series |
 
+#### 1.3.21 (NEW, exploratory) Swing / multi-day continuation
+*Exploratory drill-down tier (§1.5.1 / §7.7.1) — hypothesis generators on
+coarse-cell survivors, not additions to the primary `(classification ×
+regime)` BY family. No new ingest, no schema change: every column below is
+in the frozen Phase 0 v7 schema.*
+
+| Question | Algorithm / columns | Strategy answer |
+|---|---|---|
+| Does 9:30–10:00 strength predict 1d/2d/3d/5d/10d/21d continuation? | DP across horizons on `ret_<H>_total` (excess) | horizon-specific edge surface |
+| Is the edge overnight-gap or RTH drift? | `gap_return_day_{1-5}` vs `rth_return_day_{1-5}` decomposition | separates carry risk from intraday alpha |
+| Do gains reverse after day 1 / 3 / 5? | DP value trajectory over `1d/2d/3d/5d` path checkpoints + `close_max/min_ret_<H>` | exhaustion-horizon map |
+| Hold vs exit after day 1 if up / flat / down? | DP over daily checkpoints | let-winners-run / time-stop / invalidation rule |
+| Does signal freshness improve continuation? | MI + DP conditioned on `signal_first_in_{5,10,20}d` | first-signal vs chased-signal policy |
+| Are 52w-high breakouts different from extended / dead-cat names? | conditional DP on `close / high_52w` (ratio derived at query time) | breakout-continuation vs mean-reversion |
+| Does day-0 close location predict continuation? | MI on `post_entry_close_vs_high_return`, `next_day_close_location_in_range` | close-near-high vs fade setups |
+
+*Resolution note: beyond 5d there are no daily path-state checkpoints
+(RFC §9.5 cut) — use the wide-table daily summary stats (`max_drawdown_<H>`,
+`close_max_ret_<H>`, `bars_to_*` at 10d/21d) for the longer trajectory.*
+
+#### 1.3.22 (NEW, exploratory) Short-side / downside research → graduation path
+*The short side is fully in scope as **research**; only short **execution**
+is gated (§1.6). `forward_outcomes` is direction-symmetric, so every
+downside question below is answerable today at full rigour. This is not a
+sideline: the documented momentum premium has historically carried a large
+short leg (losers continuing to lose), and a long-short book is how the edge
+gets hedged to market-neutral (§2.3) — if the short leg proves competitive
+here, that is a first-class finding.*
+
+*What is gated is the **executable claim**. Borrow fee / locate / SSR /
+recall / squeeze asymmetry are unrecorded, and they bite hardest exactly
+where the apparent short edge is juiciest (low-float, meme, distressed,
+biotech blowups) — so a short Sharpe computed from price data alone is
+**systematically overstated**. Until that data lands, short results are
+reported as (a) downside **patterns**, (b) long-side **avoid-filters**
+(feed §2.2), and (c) an explicit **long-vs-short edge comparison** — never
+pre-registered as a tradeable short until they graduate (note below).*
+
+| Question | Algorithm / columns | Strategy answer |
+|---|---|---|
+| Does negative 10:00 momentum predict downside continuation? | mirror DP (§1.3.17) on `first_cross_down_*`, `close_min_ret_<H>` | downside-continuation pattern / long-avoid |
+| Gap-up overextension — continue or fade? | conditional DP on `overnight_gap` × `premarket_volume_vs_20d_median` × `next_day_fade_from_open` | gap-and-go vs gap-fade map (long entry-quality + avoid) |
+| Does failed momentum (strong, then loses open/VWAP) have negative expectancy? | path-state DP on `pre_entry_ret_from_high`, `rate_of_change < 0` | long blacklist |
+| Does high short interest predict downside vs squeeze? | MI on `short_interest.parquet` (bi-weekly FINRA) × regime | separates short-pattern from squeeze risk — **approximate, no borrow data** |
+| Which weak names are untradeable even as patterns? | `halt_gap_crossed`, `bar_gap_minutes_max_<H>`, §6.1 spread cohorts | exitability / feasibility filter |
+| **Is the short leg's cost-adjusted excess edge larger than the long leg's?** | mirror DP + per-leg HB comparison (§7.4) | **the decision-relevant comparison** — sizes the prize before any borrow-data spend |
+| Does a long-short (market-neutral) book beat long-only on the same cells? | per-cell long-minus-short excess return | tests the §2.3 beta-hedge thesis directly |
+
+**Graduation path.** If the long-vs-short comparison shows the short leg is
+competitive or better, that result *justifies* the one deferred ingest that
+makes shorts executable — `float_short_interest.parquet` (borrow fee +
+days-to-cover + float + shares outstanding; RFC future-tables list). With it,
+the §6.1 cost model extends to the short side and this family graduates from
+pattern-tier to a pre-registerable executable family under the full §7.7.1
+gauntlet. The sequence is deliberate: **let the size of the short edge pay
+for the data that lets you trade it**, rather than buying the data on faith
+or trading shorts blind on overstated price-only backtests.
+
+#### 1.3.23 (NEW, exploratory) Setup-archetype discovery
+*Exploratory drill-down tier. Method in §7.4.1. Clusters are hypothesis
+generators only — any archetype someone would trade is promoted to a
+concrete `(classification × regime)` cell and run through the full §7.7.1
+gauntlet + holdout.*
+
+| Question | Algorithm / columns | Strategy answer |
+|---|---|---|
+| What natural pre-entry setup clusters exist? | unsupervised clustering on pre-entry + day-0 shape features, **blind to outcome** (§7.4.1) | archetype taxonomy (gap-and-go, opening-drive, first-hour-breakout, drift, spike, …) |
+| Which archetypes clear cost-adjusted excess expectancy? | per-cluster expectancy via coarse-cell machinery + §6.1 costs | tradable-setup map |
+| Which are halt / liquidity artifacts? | `halt_gap_crossed` + spread cohorts per cluster | artifact rejection |
+| Which work intraday but fail swing? | edge surface (§2.4) per cluster across horizons | day-trade vs swing split |
+| Are archetypes stable across eras? | §2.5 walk-forward + per-era cluster stability | currentness |
+
 ### 1.4 Overall reasoning — why this combination is well-designed
 
 Three principles tie the data, the engine, and the questions together:
@@ -412,7 +502,7 @@ rescue findings):**
 | Materialized target-before-stop label set | 9 pairs (v6) | RFC §9 |
 | Primary BY discovery family | coarse: (classification × regime) | §1.5.1 power analysis; finer slices = drill-down under hierarchical FDR |
 | Signal definition(s) under test | pre-specified before discovery (default: `intraday_ret_0930_to_1000 > 0`) | Each variant tried multiplies the §7.7.1 family; an untracked signal sweep is the one multiplicity door otherwise left open |
-| Trade direction | long-only | Borrow costs / locate availability out of scope by decision, not omission |
+| Trade direction (execution) | long-only | Frozen for *executable* edges only — borrow fee / locate / SSR / recall / squeeze asymmetry are unrecorded, so a short-*Sharpe* claim isn't defensible. The observational data is direction-symmetric: short-side *pattern* research + long-side *avoid-filters* stay in scope (§1.3.22); only short *execution* is out. |
 | Max pre-registered holdout hypotheses | 20 | §7.7.1; fixes the holdout family size before discovery ends |
 | Holdout FDR | BY at α = 0.05 across the pre-registered family | §7.7.1 |
 
@@ -554,6 +644,12 @@ Why this beats the positive-edge hunt:
 
 A characterized **blacklist** is durable, transferable, and almost certainly
 produces better expectancy than any positive signal you'll find unconditionally.
+
+Downside-continuation and gap-fade patterns (§1.3.22) are first-class
+blacklist inputs: "weak-by-10:00 names bleed into the close in weak-breadth
+regimes" is a long-side *avoid-filter* even though shorting it is out of
+scope. The negative-space pass mines the short *perspective* for long-side
+friction reduction without ever taking a short.
 
 ---
 
@@ -1696,6 +1792,31 @@ hierarchical shrinkage.
 
 Library: `pymc`, `numpyro`, or `cmdstanpy`. Standard textbook setup
 (Gelman et al., *Bayesian Data Analysis*).
+
+### 7.4.1 Unsupervised archetype discovery — exploratory pre-entry clustering (NOT a gating layer)
+
+The four-layer stack (MI → BN → DP → HB) has no clustering step. This adds
+one as an **exploratory** layer that *generates* candidate cells; it never
+gates a finding. It is the method behind the §1.3.23 archetype questions.
+
+**Inputs — pre-entry / day-0 shape only, blind to forward outcomes.**
+`pre_entry_*`, entry-quality proxies (wicks, `entry_price_location_in_1m_bar`,
+slippage proxy), `intraday_first_30m_*` / `intraday_first_hour_*` shape,
+premarket + `overnight_gap` context. Clustering on *outcomes* is
+selection-on-outcome — the exact trap §2 and §7.7.1 exist to prevent — so
+outcome columns are excluded from the feature matrix by construction.
+
+**Method.** Standardize → optional PCA (§4, tractability only) → k-means /
+GMM / HDBSCAN. Pick k by **stability across bootstrap resamples** (the same
+discipline as BN stability-selection in §7.7.1), not by silhouette-shopping.
+Then measure forward cost-adjusted excess expectancy per cluster using the
+existing coarse-cell machinery (§6.1 costs, day-clustered CIs).
+
+**Discipline.** A cluster is only ever a hypothesis generator. Any archetype
+someone would trade is promoted to a concrete `(classification × regime)`
+cell and run through the full §7.7.1 gauntlet + holdout — clusters do not
+enter the primary BY family on their own. Re-fit per era (§2.5) to test
+stability; exploration set only during discovery.
 
 ---
 
