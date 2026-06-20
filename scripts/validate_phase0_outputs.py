@@ -1012,10 +1012,22 @@ def market_context_checks(d, obs, raw, bars, close_t, praw):
         ((pl.col("eod_day_open") * pl.col("intraday_ret_0930_to_1000")).abs()
          / pl.col("atr_14d")).alias("mv")
     )
-    e_atr = m.filter(pl.col("mv") >= 1.0).height if m.height else None
-    r.check(f"{d} breadth_count_movers_above_1atr_at_1000",
-            ctx["breadth_count_movers_above_1atr_at_1000"] == e_atr,
-            f"ctx={ctx['breadth_count_movers_above_1atr_at_1000']} indep={e_atr}")
+    ctxv = ctx["breadth_count_movers_above_1atr_at_1000"]
+    if not m.height:
+        r.check(f"{d} breadth_count_movers_above_1atr_at_1000", ctxv is None, f"ctx={ctxv} indep=None")
+    else:
+        # A mover sitting exactly on the 1.0-ATR threshold is genuinely
+        # ambiguous: the engine's price-difference form and this |open*ret|
+        # form straddle 1.0 by ~1 ULP (e.g. mv=1.0000000000000047), so the
+        # boundary security may be counted either way. Accept the engine count
+        # when it lies in [strictly_above, strictly_above + on_boundary].
+        EPS = 1e-9
+        above = m.filter(pl.col("mv") >= 1.0 + EPS).height
+        ties = m.filter((pl.col("mv") >= 1.0 - EPS) & (pl.col("mv") < 1.0 + EPS)).height
+        e_atr = m.filter(pl.col("mv") >= 1.0).height
+        r.check(f"{d} breadth_count_movers_above_1atr_at_1000",
+                ctxv is not None and above <= ctxv <= above + ties,
+                f"ctx={ctxv} indep∈[{above},{above + ties}] strict={e_atr}")
     av = obs.filter(
         pl.col("intraday_ret_0930_to_1000").is_not_null()
         & pl.col("premarket_vwap").is_not_null() & pl.col("eod_day_open").is_not_null()
@@ -1495,12 +1507,28 @@ def _fo_splits():
     return pl.read_parquet(REF / "splits.parquet"), pin
 
 
-def _fo_factor(sp_all, pin, sym, d):
-    rows = sp_all.filter(
-        (pl.col("display_symbol") == sym)
-        & (pl.col("execution_date") > d)
-        & (pl.col("execution_date") <= pin)
-    )
+def _fo_factor(sp_all, pin, sym, d, sid=None):
+    """Pin-basis cumulative split factor for (security, day). Mirrors the
+    engine `adjustment_factor` (bar_reader.rs:259): splits_by_sid.get(sid) OR
+    splits_by_symbol.get(sym) — SID-FIRST, symbol fallback. Symbol-only keying
+    is wrong when a ticker is later reused by an unrelated security: that
+    security's split shares the display_symbol and leaks into the factor.
+    Sid-first isolates the security. `sid=None` reproduces the legacy
+    symbol-only behaviour byte-for-byte (used where sid/symbol cannot diverge,
+    e.g. the large-cap SAMPLE)."""
+    rows = None
+    if sid is not None:
+        by_sid = sp_all.filter(
+            (pl.col("security_id") == sid) & (pl.col("execution_date") <= pin)
+        )
+        if by_sid.height > 0:  # sid present in splits_by_sid → no symbol fallback
+            rows = by_sid.filter(pl.col("execution_date") > d)
+    if rows is None:
+        rows = sp_all.filter(
+            (pl.col("display_symbol") == sym)
+            & (pl.col("execution_date") > d)
+            & (pl.col("execution_date") <= pin)
+        )
     f = 1.0
     for fr, to in rows.select("split_from", "split_to").iter_rows():
         f *= fr / to
@@ -2357,7 +2385,15 @@ def forward_terminal_checks(d, n_check=3):
         while k < len(corpus) and corpus[k] <= dl:
             dd = _md_daily(corpus[k], {sym})
             if sym in dd:
-                series.append((corpus[k], dd[sym][0]))
+                # _md_daily adjusts by the SYMBOL factor; rescale to the
+                # SID-first factor so a reused ticker's split cannot leak into
+                # this (delisting) security's close. Bit-identical when the two
+                # factors agree (the common case); only the reused-ticker case
+                # diverges (e.g. ADOM's sid-keyed reverse split under EVTV).
+                fsym = _fo_factor(sp_all, pin, sym, corpus[k])
+                fsid = _fo_factor(sp_all, pin, sym, corpus[k], sid)
+                cl = dd[sym][0] if fsid == fsym else dd[sym][0] / fsym * fsid
+                series.append((corpus[k], cl))
             k += 1
         last = series[-1] if series else None
         window_end = min(dl, matrix_end)

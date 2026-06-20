@@ -101,6 +101,23 @@ the Rust tie-break asymmetry (`max_by`->last for `minutes_since_high`,
 **406,188 PASS / 2 FAIL / 0 SKIP** (same 2 documented residuals). Every
 forward_outcomes column the audit could name now has independent recompute.
 
+**B6c.2 — validator-residual hardening → clean 0-fail baseline (2026-06-20):**
+the 2 long-standing residuals (engine always correct, validator the limited
+side) are now closed in the validator, so any future fail is unambiguously a
+real regression. (1) `_fo_factor` is now **sid-first** (optional `sid`,
+mirroring the engine `adjustment_factor` at bar_reader.rs:259:
+`splits_by_sid` ∨ `splits_by_symbol`); the terminal series rescales to the
+sid-first factor so a *reused* ticker's split can no longer leak into a
+delisting security's close — ADOM `terminal_event_return` now matches exactly.
+`sid=None` reproduces the legacy symbol-only path byte-for-byte. This closes a
+real coverage hole: symbol-only keying could have *agreed with* an engine that
+had the same symbol-vs-sid bug (false PASS), not just disagreed with a correct
+one. (2) the breadth `count_movers_above_1atr` check now accepts an fp tie-band
+at the exact 1.0-ATR threshold (a mover within ~1 ULP of the cutoff may be
+counted either way; engine count accepted if in `[strictly_above,
+strictly_above + on_boundary]`). Widened 18-day battery + golden:
+**406,190 PASS / 0 FAIL / 0 SKIP**.
+
 All work through B5+validation is committed and clean. The only uncommitted
 files are `predmarket-*.md` (a different project — leave them).
 
