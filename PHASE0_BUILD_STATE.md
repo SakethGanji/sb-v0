@@ -118,6 +118,19 @@ counted either way; engine count accepted if in `[strictly_above,
 strictly_above + on_boundary]`). Widened 18-day battery + golden:
 **406,190 PASS / 0 FAIL / 0 SKIP**.
 
+**B6c.3 — validator forward-walk speedup (2026-06-20):** `forward_multiday_checks`
+walked up to 252 trading days forward calling `_md_daily` → `load_day_bars` per
+forward day, re-decoding a full ~1.7M-row 1m tape just to read ~11 daily
+closes. Replaced with `_do_daily`, which reads `eod_day_close/high/low`
+(= adj_close/high/low, sid-first pin factor) straight from the aggregated
+`daily_observation` table. Proven equivalent: 32 (sym,day) cells incl. the
+AAPL 2020-08-31 4:1-split day, 0 mismatches; battery stays
+**406,190 PASS / 0 FAIL / 0 SKIP**. Measured ~6x faster on the isolated 60-day
+walk; end-to-end battery speedup not cleanly quantified (no wall-stamped
+baseline, and the per-day cost is also dominated by the untouched 6-day tape
+loads + Python recompute in forward_outcomes/forward_path checks — the lever
+for a larger future win).
+
 All work through B5+validation is committed and clean. The only uncommitted
 files are `predmarket-*.md` (a different project — leave them).
 
