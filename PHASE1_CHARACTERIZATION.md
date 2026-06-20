@@ -75,6 +75,17 @@ pooling-masks-an-era pattern — **but 0/72 2020 combos are statistically signif
 even gross**, it's net-negative, and non-persistent: the §1.3.20 meme-era inflation
 artifact, not an edge. The structural blacklist is era-independent.
 
+### 2.4b Systematic factor scan — consistent structure, but untradeable (`phase1-factor-findings.md`)
+A signal-agnostic scan of every pre-entry feature × horizon (cross-sectional decile
+spreads, era-stability, BY) **did find consistent structure**: low-volatility / smaller-
+size / lower-liquidity / pullback factors predict forward excess return, **5/5 eras**.
+BUT verification (block-bootstrap + clean universe) shows it's concentrated in
+**small/micro-cap, high-vol, illiquid names** (36% of the extreme decile) — the
+blacklisted corner — and **collapses to noise on the deployable universe** (atr 21d
+−8.5b, CI incl. 0). It's the known low-vol/size anomaly in the friction corner, and a
+long-short factor (short leg gated). The tradeable cross-section is efficient. Mirrors
+the blacklist: structure concentrates where friction prevents capture.
+
 ### 2.5 Breadth sweep — signals & exit rules (`phase1-sweep-findings.md`)
 - **Entry (16 signals × 3 horizons = 48):** 0 net-positive, 0 BY survivors. The one
   gross-positive blip (buy extreme intraday losers → EOD) dies after cost.
