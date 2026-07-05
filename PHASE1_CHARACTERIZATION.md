@@ -1,8 +1,9 @@
 # Phase 1 — Characterization (Cycle 1 Close)
 
-**Date:** 2026-06-20 · **Status: CYCLE 1 CLOSED.** This is the standing record of
-what Phase 1 found. It consolidates the nine step-level findings docs (linked at
-the end) into one authoritative artifact, per `phase1-research-strategy.md` §1.7.
+**Date:** 2026-06-20 · **Amended 2026-07-05** (multivariate / meta-label layer added —
+see §0 third bullet, §2.3, §6). **Status: CYCLE 1 CLOSED.** This is the standing record
+of what Phase 1 found. It consolidates the step-level findings docs (linked at the end)
+into one authoritative artifact, per `phase1-research-strategy.md` §1.7.
 
 ---
 
@@ -25,6 +26,19 @@ friction prevents its capture.** Both halves are rigorously earned, not assumed.
   factor** (capturing it needs shorting the high-vol leg, which is gated). It is
   documented anomaly behavior, not novel alpha, and it is **behind glass**: friction
   and the long-only constraint prevent harvesting it.
+- **The learnable structure is volatility, not direction** (added 2026-07-05,
+  `phase1-metalabel-findings.md`). The multivariate / conditional / meta-label layer —
+  the thing the univariate scans could not see — was tested directly. A joint model
+  (95 features incl. market-state) carries only a **faint, untradeable** directional
+  trace at 1d (rank-IC 0.007, beats a noise null but not cost/CI; gone by 5d). A direct
+  **meta-labeling** classifier is more revealing: the *directional* labels ("beat SPY")
+  are null (AUC ≈ 0.50), but the *trade-quality* label "+2% before −2%" is **strongly,
+  stably, model-agnostically predictable** (OOS AUC 0.63, GBM ≈ linear). It is a
+  **volatility / barrier-resolution** signal (top-decile target:stop ≈ 1.05 — a coin
+  flip on *which* barrier; importances dominated by realized-vol / dispersion / market
+  activity) and it **does not monetize** net of cost, flipping sign by year. These
+  features are rich in *variance* information, poor in *directional* information —
+  exactly why meta-labeling reorganizes the variance beautifully yet yields no edge.
 
 Every result points the same way and is mutually consistent. What Phase 1 produced:
 a durable **structural blacklist**, a **near-zero predictability ceiling** in liquid
@@ -81,9 +95,15 @@ friction, not signal-driven momentum bleed**.
 MI of 16 pre-entry features vs the 1d beat-SPY outcome, permutation-corrected:
 **near-zero everywhere.** Best cell 7.33 millibits = **0.7% of outcome uncertainty**
 (and already blacklisted); 15/34 cells at the noise floor; tradeable liquid cells
-≈ 0.27m. **No meta-labeling headroom** ⇒ Phase 4 ML is not warranted on this
-data/horizon. Feature ranking (all negligible): concentration > realized-vol-rank >
-momentum magnitude.
+≈ 0.27m. Feature ranking (all negligible): concentration > realized-vol-rank >
+momentum magnitude. **CAVEAT (2026-07-05): this ceiling is _univariate_** — it caps
+the MI of any *single* feature, not *joint* models. The earlier gloss "no meta-labeling
+headroom ⇒ Phase 4 ML not warranted" was **overstated** and is superseded by the direct
+multivariate / meta-label test (§0 third bullet, §6, `phase1-metalabel-findings.md`):
+joint models and a meta-label classifier *do* find learnable structure — but it is
+**volatility, not directional edge**, and does not monetize. The practical conclusion
+(no tradeable directional edge on this data) stands; the *reason* is now measured
+directly rather than inferred from a univariate ceiling.
 
 ### 2.4 Deliverable #3 — Stability across timeframe & era (`phase1-stability-findings.md`)
 Swept the deployable cohort across 12 offsets × 6 horizons × 5 years. **0/72
@@ -165,7 +185,13 @@ The three coincide: analytic MDE ↔ false-positive control ↔ true-positive po
   positive point estimate was an overfit mirage the cross-fit exposed). DP confirmed
   as a result, not a gate.
 - **Hierarchical Bayes (Stage C):** gated out — nothing to pool (no positive cells).
-- **Phase 4 meta-labeling:** ruled out by the near-zero ceiling (#2).
+- **Phase 4 meta-labeling:** **directly tested** (2026-07-05, `phase1-metalabel-findings.md`),
+  not just gated by the ceiling. A joint multivariate probe (95 features incl. market-state)
+  and a meta-label classifier (accept/reject on "+2% before −2%") were run walk-forward OOS
+  with permutation nulls. Result: real, model-agnostic **volatility / barrier-resolution**
+  structure (OOS AUC 0.63, GBM ≈ linear) but **no directional edge** and **no monetization**
+  net of cost (top-decile barrier P&L ≈ 0 gross, negative net, flips by year). Return-ranking
+  was null (rank-IC ~0.007). Meta-labeling confirmed as a *result*, not merely a gate.
 
 ---
 
@@ -205,9 +231,10 @@ and treat the validated engine + blacklist as the deliverable.
 `phase1-cost-model-findings.md` · `phase1-blacklist-findings.md` ·
 `phase1-validation-findings.md` · `phase1-ceiling-findings.md` ·
 `phase1-stability-findings.md` · `phase1-sweep-findings.md` ·
-`phase1-dp-findings.md` · `phase1-factor-findings.md`
+`phase1-dp-findings.md` · `phase1-factor-findings.md` · `phase1-metalabel-findings.md`
 **Scripts:** `scripts/phase1_{power_mde_pass,tracer_bullet,cost_model,verify,
-blacklist,placebo,synthetic,ceiling,stability,sweep,dp,factor_scan,factor_verify}.py`
+blacklist,placebo,synthetic,ceiling,stability,sweep,dp,factor_scan,factor_verify,
+joint_probe,metalabel,metalabel_economic,metalabel_control,momentum_reliability}.py`
 **Plan:** `phase1-research-strategy.md` (frozen) · **Session handoff:**
 `PHASE1_SESSION_2026-06-20.md`
 **Analysis outputs:** `data/phase1_analysis/*.parquet` (T7)
