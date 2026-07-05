@@ -239,11 +239,12 @@ and treat the validated engine + blacklist as the deliverable.
 `phase1-cost-model-findings.md` · `phase1-blacklist-findings.md` ·
 `phase1-validation-findings.md` · `phase1-ceiling-findings.md` ·
 `phase1-stability-findings.md` · `phase1-sweep-findings.md` ·
-`phase1-dp-findings.md` · `phase1-factor-findings.md` · `phase1-metalabel-findings.md`
+`phase1-dp-findings.md` · `phase1-factor-findings.md` · `phase1-metalabel-findings.md` ·
+`phase1-frontier-findings.md`
 **Scripts:** `scripts/phase1_{power_mde_pass,tracer_bullet,cost_model,verify,
 blacklist,placebo,synthetic,ceiling,stability,sweep,dp,factor_scan,factor_verify,
 joint_probe,metalabel,metalabel_economic,metalabel_control,momentum_reliability,
-direction,barrier_sweep}.py`
+direction,barrier_sweep,vol_forecast,pead,pead_verify}.py`
 **Plan:** `phase1-research-strategy.md` (frozen) · **Session handoff:**
 `PHASE1_SESSION_2026-06-20.md`
 **Analysis outputs:** `data/phase1_analysis/*.parquet` (T7)
