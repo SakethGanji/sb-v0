@@ -39,6 +39,14 @@ friction prevents its capture.** Both halves are rigorously earned, not assumed.
   activity) and it **does not monetize** net of cost, flipping sign by year. These
   features are rich in *variance* information, poor in *directional* information —
   exactly why meta-labeling reorganizes the variance beautifully yet yields no edge.
+  The **actionable long/short target** (two-stage: among movers, pick up vs down, with
+  sector-relative / 52w / MA-regime features added) is a **coin flip** (OOS AUC 0.51,
+  inside null, net-negative, flips by year). A **barrier-threshold sweep** (8 thresholds,
+  pct + ATR) *decomposes* the 0.63: a real, ATR-robust **volatility-expansion** magnitude
+  signal (AUC_move 0.65–0.85) blended with a **null direction** signal (0.5 at every
+  threshold). Closed **five ways**. The one positive to carry: the stock-normalized
+  vol-expansion signal is the natural target for an options/straddle (path 2) — pending
+  IV data to test whether it beats implied vol.
 
 Every result points the same way and is mutually consistent. What Phase 1 produced:
 a durable **structural blacklist**, a **near-zero predictability ceiling** in liquid
@@ -234,7 +242,8 @@ and treat the validated engine + blacklist as the deliverable.
 `phase1-dp-findings.md` · `phase1-factor-findings.md` · `phase1-metalabel-findings.md`
 **Scripts:** `scripts/phase1_{power_mde_pass,tracer_bullet,cost_model,verify,
 blacklist,placebo,synthetic,ceiling,stability,sweep,dp,factor_scan,factor_verify,
-joint_probe,metalabel,metalabel_economic,metalabel_control,momentum_reliability}.py`
+joint_probe,metalabel,metalabel_economic,metalabel_control,momentum_reliability,
+direction,barrier_sweep}.py`
 **Plan:** `phase1-research-strategy.md` (frozen) · **Session handoff:**
 `PHASE1_SESSION_2026-06-20.md`
 **Analysis outputs:** `data/phase1_analysis/*.parquet` (T7)

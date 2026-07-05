@@ -74,19 +74,68 @@ Barrier P&L: target_first→+2%, stop_first→−2%, neither→hold-to-close (`r
   `volatility_percentile_today`, `realized_vol_21d_rank` push toward target; momentum-magnitude
   features enter with **mixed signs** (no clean directional predictor).
 
+## 5. Direction test — two-stage, long/short, actionable target (`phase1_direction.py`)
+Per a critique that "beat SPY" is the wrong target: test the actionable one — *among names the
+volatility gate says will move, pick long vs short.* Clean two-stage: Stage-2 direction label =
+`target_first` vs `stop_first` on **resolved movers ONLY** ("neither" dropped — the magnitude
+signal that inflated L2's AUC is stripped out). Added the last available features: **sector-relative
+strength, distance-from-52w-high, SPY/QQQ/IWM 20/50/200-MA regime** (106 feats total).
+- **Stage-2 direction OOS AUC 0.5101 — inside the permutation null (0.5106). A coin flip.**
+  P(up) deciles barely spread (D0 44.4% → D9 52.9% up-first), inside noise.
+- **Long/short economics** (long high P(up), short low, skip middle, borrow ~2bp for liquid):
+  directional accuracy **50.0–50.9%** across all confidence bands; best band +3.5 gross → **−7.3
+  net@10bp**. **Flips by year: 2018 dir-acc 45.4% (actively wrong) / 2019 51.4% / 2020 53.3%** —
+  regime beta, not edge.
+- The three new features added **nothing** directional. Direction is not in the price/volume set.
+
+## 6. Barrier-threshold sweep — decomposing the 0.63 (`phase1_barrier_sweep.py`)
+Per a critique that fixed ±2% is a design choice biased toward always-volatile names: hold
+cohort/features/folds/horizon(1d) constant, vary ONLY the barrier (built from `first_cross_up/down`
+timing; constructed ±2% validated 100% vs the materialized column). Two AUCs: `AUC_move` (resolves
+to *either* barrier = pure magnitude) and `AUC_L2` (target_first = the original metric).
+
+| barrier | resolve% | AUC_move | AUC_L2 |  | barrier | resolve% | AUC_move | AUC_L2 |
+|---|---|---|---|---|---|---|---|---|
+| pct ±1% | 92.8 | 0.852 | 0.526 |  | atr ±0.5 | 89.1 | 0.687 | 0.515 |
+| pct ±2% | 60.6 | 0.793 | 0.629 |  | atr ±1 | 42.9 | 0.648 | 0.556 |
+| pct ±3% | 36.0 | 0.775 | 0.713 |  | atr ±2 | 7.7 | 0.698 | 0.633 |
+| pct ±5% | 14.0 | 0.813 | 0.799 |  | atr ±3 | 2.1 | 0.740 | 0.724 |
+
+- **Genuine stock-normalized signal EXISTS:** ATR-normalized `AUC_move` stays **0.65–0.74** (≫ 0.50)
+  — a real volatility-**expansion** signal (predicts an unusually large move vs the stock's OWN
+  baseline), not purely the static "always-volatile" fact.
+- **But fixed-% was partly that artifact:** fixed-% `AUC_move` (~0.78–0.85) > ATR (~0.65–0.74); the
+  ~0.12 gap is the trivial cross-sectional "which stocks are always volatile" ranking, removed by
+  ATR normalization (as the critique predicted).
+- **The 0.63 decomposed:** `AUC_L2` rises monotonically with the threshold (0.53→0.80) purely because
+  its negative class shifts from `stop_first` (a *direction* question → 0.5, null) at tight barriers
+  to `neither` (a *magnitude* question → high) at wide barriers. The mix reproduces the curve to two
+  decimals (±2%: 0.5·0.44 + 0.79·0.56 ≈ 0.63 ✓). **Direction contributes exactly 0.5 at every
+  threshold.** The original 0.63 was a ~50/50 blend of a strong magnitude signal and a null
+  direction signal — never a clean signal.
+
 ## Verdict
 The multivariate / conditional / meta-label layer is **not empty, but not edge**:
 - Joint models carry a faint, untradeable directional trace at 1d (beats noise, not cost/CI).
 - The meta-labeling objective is **real and model-agnostic** (AUC 0.63, GBM ≈ linear) — but it
   predicts **barrier RESOLUTION (volatility), not direction**, and **does not monetize** net of
   cost, flipping sign by year.
+- The **actionable long/short target** (among movers, pick up vs down) is a **coin flip** (AUC 0.51,
+  inside null, net-negative, flips by year) even with sector-relative / 52w / MA-regime features added.
+- The barrier sweep **decomposes** the 0.63: a real, ATR-robust *magnitude / vol-expansion* signal
+  (AUC_move 0.65–0.85) blended with a *null direction* signal (0.5 at every threshold).
 
 This confirms the caveat exactly: *meta-labeling reorganizes existing information; it cannot
 create information that isn't there.* These features are **rich in variance information, poor in
 directional information** — so a classifier reorganizes the variance beautifully, and it isn't
 tradeable (net of cost, and long-only / no options). The price-volume hypothesis is now closed
-four ways: univariate null → multivariate near-null → meta-label directional null → model-agnostic
-confirmation the only learnable structure is volatility.
+**five ways**: univariate null → multivariate near-null → meta-label directional null → model-agnostic
+volatility confirmation → **actionable long/short target null (8 barrier thresholds)**.
+
+The one *positive* to carry forward: a genuine stock-normalized **volatility-expansion** signal
+(ATR AUC_move 0.65–0.74) — the natural target for a long-gamma / straddle trade. Whether it
+monetizes depends on beating **implied vol**, which is unfalsifiable without options data → the
+concrete justification for an options/IV cycle-2 (path 2), not more price/volume analysis.
 
 ## Caveats
 - OOS is exploration-window 2018–2020; the 2023+ holdout remains untouched.
