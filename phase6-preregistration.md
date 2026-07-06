@@ -42,3 +42,29 @@
 1. A transition-matrix regime that is NOT explainable by vol/liquidity ordering (vs prediction).
 2. An event whose forward drift **differs across states** with BY-significance and era
    stability — i.e., the market misprices an event conditional on state, not the event itself.
+
+---
+
+# Phase 6B pre-registration — feature-continuation / signal-decay (frozen 2026-07-06, before code)
+
+The user's exact question, in its tradeable form: **"Can we forecast signal persistence
+BEFORE seeing it — and does the forecast improve forward return net of cost?"** (The
+hindsight form — "what happens if the good variables persist" — is descriptive only and is
+reported as Q1 context, never as an edge.)
+
+- **Setup population** (knowable at 10:00 entry): PRIMARY = top-decile trailing-21d momentum
+  within day; SECONDARY = top-decile vol-trend (yang-zhang 5/42 ratio).
+- **Q1 (descriptive):** among setup stocks, P(still top-decile at t+1/t+3/t+5).
+- **Q2 (forecast):** predict the t+5 persistence label from day-t knowable features
+  (state vector + momentum depth + gap/intraday/beta, ~12 features), HistGB, expanding
+  walk-forward by year with 5d embargo, OOS AUC vs within-day label-permutation null.
+- **Q3 (economics, the verdict):** among OOS setup stocks, quintiles of predicted
+  persistence probability → realized ret_5d_excess_spy, daily series, block bootstrap
+  (block=5). PASS = top-quintile net@20 > 0 with CI excluding 0, ≥4/5 eras positive,
+  and a monotone quintile ladder.
+- **Registered expectations:** Q1 persistence well above base rate (momentum ranks are
+  sticky); Q2 AUC clearly above null (~0.65+, mechanically predictable from rank depth +
+  low vol); **Q3 ≈ 0 net (the registered null)** — Phase 2/3 found the intraday analogue
+  (P(win) rises, remaining expectancy ~0), and predictable-persistence that pays would be
+  a free lunch sitting in the most-arbitraged corner of the market.
+- Train window 2016-06..2020-12 only; validation/holdout rules unchanged.

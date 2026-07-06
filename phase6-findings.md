@@ -38,6 +38,28 @@ dynamics of price/volume states are real, stable, and already priced; the events
 redirect them are either priced within a day (SUE), gated (insider short side), or split
 too thin to measure (most interaction cells).
 
+## Phase 6B — feature-continuation / signal-decay (the user's exact question, registered form)
+
+"Can we forecast signal persistence BEFORE seeing it, and does the forecast pay?"
+(`phase6b_signal_decay.py`; pre-registered in `phase6-preregistration.md` §6B.)
+
+- **Q1 (descriptive): favorable variables DO persist.** Top-decile momentum stays top-decile
+  80.2% at t+1, 65.1% at t+3, 54.7% at t+5 (base 10%). Vol-trend decays much faster
+  (72% → 12% by t+5) — vol *expansion* is a spike, momentum *rank* is sticky.
+- **Q2: persistence is FORECASTABLE.** Walk-forward OOS AUC **0.741** vs permutation null
+  0.576 — you genuinely can tell, at entry, which momentum setups will still look good
+  next week.
+- **Q3: the forecast pays NOTHING — mildly negative.** Forward 5d excess by predicted-
+  persistence quintile (OOS 2018-2020): Q1 −2.2bp … **Q5 −27.5bp gross** CI[−58.2,−0.6],
+  net@20 −47.5, eras 0/3 positive. The most-confidently-persistent setups did *worst*.
+  **Registered null confirmed** (and the sign echoes the lottery/overextension pattern —
+  the stocks most certain to keep "looking good" are the most crowded/extended ones).
+
+This is the Phase 2/3 result reproduced at daily scale and in its strongest form: the
+market lets you predict *that the setup will continue to look good* (AUC 0.74!) and pays
+you nothing for knowing it, because "looking good" was never the same thing as "about to
+go up." Signal persistence ≠ return continuation — now measured, not argued.
+
 ## Project status after Phase 6
 
 Free queue: **empty** (Phases 4–6 spent it: SUE both clocks, subsets, score-tail,
