@@ -103,6 +103,22 @@ below so a positive result cannot be mistaken for an alpha lead.
 4. **Deliverable:** `phase7-findings.md` §7.2. A PASS goes to 2021-22 confirmation
    per §7.7 before a dollar moves.
 
+## Step 3.5 — live cost-calibration book (optional; tiny capital; runs alongside Step 3)
+
+**What:** the one measurement history cannot provide (adopted from the Program C review,
+`phase7-magnitude-program.md` §7): a small live book of trades sized to **measure fills,
+not to profit** — market and limit orders in the deployable universe, logged against the
+quoted/arrival price. Purpose: replace the frozen cost model's deliberate liquid-cell
+upper bound (~10–17bp assumed vs ~1–3bp believed true) with a measured number.
+
+- Not a strategy; no expectancy claim possible or sought. Position direction randomized,
+  flat by close, size at the smallest measurable increment.
+- **Deliverable:** a measured spread/impact table for the liquid cells →
+  `phase1-cost-model-findings.md` amendment. Effect: every existing net verdict
+  sharpens; if true costs are ~1–3bp, a handful of "real gross, dead net" structures
+  (e.g. reversal's −15.8bp/5d net at ~30bp round-trip) deserve one re-read at measured
+  cost — as recomputation of existing results, not new searches.
+
 ## Step 4 — Seal (one writing session; no code)
 
 Write `FINAL_REPORT_ADDENDUM.md`:
@@ -129,6 +145,7 @@ Write `FINAL_REPORT_ADDENDUM.md`:
 | 1 · Test 7.1 | $0 | one overnight run + one write-up session | nothing — ready now |
 | 2 · A2 sprint | $0 | freeze (½ session) + profile build + 2 property tests | nothing; parallelizable with 1 |
 | 3 · Branch B | ~$50–100 | gate + one test, ~2 sessions | funding decision |
+| 3.5 · cost calibration | tiny live book | passive, weeks of logging | broker access; optional |
 | 4 · Seal | $0 | one session | 1–3 complete (or 3 explicitly declined) |
 
 Explicitly out of scope, permanently, with the citation that closes each: policy
@@ -136,6 +153,10 @@ grammars and strategy-composition searches (theorem, `phase7-magnitude-program.m
 any stop/exit/management architecture (`phase7-stoploss-closure.md`); conditional-entry
 or invalidation-pocket scans (Phase 4 PRIM pipeline null); new directional
 models/indicators on the same data (Phases 1–6B, closed as a class); Channel X execution
-work (no quote data). Declining Branch B is allowed; it converts one line of the
+work (no quote data); "Program C" mechanism/network/disagreement modeling on price/volume
+data (`phase7-magnitude-program.md` §7 — collapses into A/B; its role is choosing the
+next dataset if the project reopens); tax-loss harvesting (real, direction-free,
+volatility-loving — but engineering against one's tax bill, not market research).
+Declining Branch B is allowed; it converts one line of the
 exhaustion statement from "measured" to "untested by choice, prior poor" — the addendum
 must then say exactly that.

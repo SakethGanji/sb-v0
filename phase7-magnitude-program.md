@@ -284,6 +284,68 @@ gets a conditional answer, available now:
 If either test PASSes, the standing confirmation protocol
 (`phase1-research-strategy.md` §7.7) applies unchanged: validation split, then decide.
 
+---
+
+## 7. Program C disposition (added 2026-07-06, late — closure, not dismissal)
+
+A third framing was considered and evaluated: stop modeling price and model the market's
+own decision process — mechanisms, information propagation networks, disagreement,
+information-seeking trades ("Program C", vs A = predict the market, B = optimal policy
+given predictions). Recorded here so the question is answered once, by argument, and
+does not re-enter as drift.
+
+**The valid core.** Program C's central question — *what economic activity becomes
+profitable when direction is unknowable but magnitude is knowable?* — has a classical
+answer: **selling insurance against movement**. The market maker and the option writer
+are paid *because* direction is unknowable, and both price their service off expected
+magnitude. The natural consumer of a magnitude forecast is a liquidity provider, not a
+direction guesser. The map, restated through that lens:
+
+| who needs magnitude | route | status |
+|---|---|---|
+| options market (IV, straddles, vol selling) | Channel C — **Branch B** | the one retail-accessible seat; Step 3, upgraded meaning |
+| liquidity provision (spreads, reversal, limit orders) | doors 7 / X1 | measured (reversal = slow-motion market making, real gross, cost-wall net) or quote-data-gated |
+| risk tools (sizing, drawdown control) | Channel G | Phase 5 validated; margin = Test 7.1 |
+| tax engineering (harvest volatility) | out of scope | real, direction-free, retail-accessible — engineering, not market alpha |
+
+This re-derives the existing map from economic first principles — Grossman-Stiglitz as
+observed in `FINAL_REPORT.md` §5: the insurance premium survives only behind walls that
+keep capital out. It also upgrades Branch B: not "try options," but the single
+retail-accessible test of whether our forecast can price movement risk better than the
+market that sells it.
+
+**The rest of Program C, sorted by the standing principle** (the theorem binds an
+information set × instrument, never a narrative): mechanism modeling / "model the middle
+step" on price/volume data is the same filtration wearing an economic story — Phase 6 is
+the executed cautionary case (dynamics framing, honest run, GARCH rediscovered); to model
+the middle step requires the middle step's data (orders, signed trades, book states) =
+the reopening condition of `FINAL_REPORT.md` §8. Network/propagation trades require
+trading the lagging name directionally (direction re-entering by the side door; sector/
+breadth/beta features already contributed ~nothing, and intraday lead-lag is HFT's core
+product); the propagation that is real here is vol spillover — magnitude again.
+Disagreement detection: the price/volume proxies (volume-without-move, dispersion,
+correlation breakdown) were in the 657 tested columns and predict magnitude, not
+direction; the genuinely new disagreement axis is options-vs-stock, i.e. **Branch B is
+the first disagreement detector**. Information-gain trading is dominated by free
+backtests on ten years of history, with one exception adopted below.
+
+**Two kernels adopted:** (1) a **live cost-calibration book** — tiny trades sized to
+measure fills, not to profit — is the only measurement history cannot provide; it
+tightens the frozen cost model's deliberate upper bound (liquid cells ~10–17bp assumed
+vs ~1–3bp true) and mechanically sharpens every existing net verdict
+(implementation plan Step 3.5). (2) **Tax-loss harvesting** noted for the record as the
+one guaranteed direction-free positive expectancy at retail — volatility-loving (the
+forecast says where harvests will appear) — but alpha against one's tax bill, not the
+market: engineering, permanently out of research scope.
+
+**Standing disposition:** Program C is not a third research program on current data —
+on price/volume it collapses into Programs A/B under the information-set argument. Its
+durable role is the layer above the reopening condition: mechanism questions are how
+the *next dataset* gets chosen (order flow vs options flow vs text) by economic
+reasoning rather than availability, if the project ever reopens.
+
+---
+
 What this program deliberately is **not**: a strategy-search loop. The single deepest
 lesson of Phases 0–6B is that this dataset punishes searches and rewards arguments —
 every search (config sweep, PRIM, score-tail) found only its own multiplicity, and every
