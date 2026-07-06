@@ -24,6 +24,14 @@ with a PASS routed through the confirmation protocol. Nothing else gets run.
 - Risk-tool verdicts and alpha verdicts are never merged. No PASS is believed without
   the 2021-22 confirmation pass.
 
+> **STATUS 2026-07-06 (end of day):** Step 1 **DONE — NULL all arms**
+> (`phase7-findings.md` §7.1). Step 2 **DONE — A2a FAIL / A2b PASS / A2c PASS**
+> (`phase7-findings.md` §A2; monetization frozen to a Branch B extension). Step 3 is
+> now governed by **`branchB-plan.md`** (upgraded: T-B1 level test prior null, T-B2
+> tail/skew test prior weak — the A2 PASSes). Also executed same day, outside this
+> plan under their own freezes: Phase 8 short interest (0/6 NULL), Phase 9 atlas +
+> 9b graduation FAIL. See `SESSION_2026-07-06.md`.
+
 ## Step 1 — RUN Test 7.1 (now; free; one overnight on the data machine)
 
 **What:** `scripts/phase7_forecast_value.py` (written, reviewed against the live data

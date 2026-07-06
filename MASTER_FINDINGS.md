@@ -175,7 +175,10 @@ Direction is only ever predictable by conditioning on **why** a stock moves (the
 **Docs:** `PHASE1_CHARACTERIZATION.md` · `phase1-*-findings.md` (power-mde, tracer, cost-model,
 blacklist, validation, ceiling, stability, sweep, dp, factor, metalabel, frontier) ·
 `phase2-findings.md` · `phase3-findings.md` · `phase4-findings.md` (true-SUE PEAD + clock) ·
-`phase4-conditional-subset-findings.md` (PRIM + score-tail) · `phase1-research-strategy.md`.
+`phase4-conditional-subset-findings.md` (PRIM + score-tail) · `phase1-research-strategy.md` ·
+**post-FINAL_REPORT (2026-07-06):** `phase7-*` (program, preregs, findings: Test 7.1 + A2) ·
+`phase8-*` (short interest) · `phase9-*` (dynamics atlas + 9b graduation) ·
+`branchB-plan.md` · `SESSION_2026-07-06.md`.
 **Scripts:** `scripts/phase1_*.py` (18) · `scripts/phase2_*.py` (5) · `scripts/phase3_*.py` (2) ·
 `scripts/phase4_*.py` (8). **Outputs:** `data/phase1_analysis/*.parquet` (+ `edgar_*.parquet`).
 **Data:** `data/outputs/` (8 tables) · `/mnt/atlas/edgar/` (bulk zips).
