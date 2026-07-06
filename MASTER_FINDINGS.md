@@ -142,6 +142,20 @@ Direction is only ever predictable by conditioning on **why** a stock moves (the
   `phase4-conditional-subset-findings.md`). No further price/volume conditional searches.
 - **Branch B — options/IV (unchanged, downgraded).** Only worth a slice if a delta-hedged
   straddle shows realized > implied net of spread; the vol signal being ~persistence says no.
+- **A2 microstructure invariants (Phase 7 Step 2) — EXECUTED at $0: 2 of 3 properties
+  EXIST** (2026-07-06, `phase7-findings.md` §A2): avg-dollar-trade-size residual rank-AC
+  **+0.72** (t+1, 5/5 eras) and Hill tail-shape **~+0.28/month both tails** persist
+  beyond the vol+liquidity blocks; volume-profile HHI real-but-decorative (+0.07 <
+  0.10 floor). Monetization map frozen: routes ONLY to a Branch B skew/smile extension.
+- **Phase 8 — short interest (positioning data) — EXECUTED at $0 and NULL 0/6**
+  (2026-07-06, `phase8-findings.md`): gate answerable on mean-IC; ΔSI/5d was
+  FDR-significant (−0.019) but era-unstable (2020 squeeze flip) → NULL by frozen rule.
+  Closes the phase1 X.1 gap; short-side texture real-but-regime-fragile, borrow-gated.
+- **Phase 9/9b — dynamics atlas + graduation test** (2026-07-06,
+  `phase9-atlas-findings.md`): variables taxonomized (identity/weather/flash);
+  reversals are vol events not direction events; the one loud atlas cell (quiet vol
+  expansion, +29.8bp/21d, t=3.45) **FAILED the family-max permutation null**
+  (selection-adjusted p=0.073) and era stability — atlas-noise, closed.
 - **Test 7.1 (Phase 7) — EXECUTED at $0 and NULL on all 3 arms** (2026-07-06,
   `phase7-findings.md` §7.1): the ML magnitude forecast adds nothing over naive trailing
   vol as a portfolio risk input (Arm B ΔSharpe CI [−0.02,+0.04]; Arm A's market-level ML

@@ -107,3 +107,27 @@ not.**
    arithmetic + the known crisis/low-vol structure — nothing here reopens Phases 1-6B.
 4. Two parked items: prior_day_last_30m_return rank degeneracy (investigate ties), and
    the quiet-vol-expansion cell (graduation-rule candidate, prior: permutation-null).
+
+---
+
+## Phase 9b — graduation test of the quiet-vol-expansion cell → **FAIL (atlas-noise, closed)**
+
+Pre-registration `phase9b-preregistration.md` (frozen; post-hoc candidate declared as
+such, selection-adjusted design). Script: `scripts/phase9b_quietvol_test.py`, 1,000
+within-(day, cap) permutations of the (vol-trend, volume-trend) pair, family-max |t|
+over 27 cells × 2 horizons, seed 20260708.
+
+- Observed cell (large, volT_up, volmT_dn): +17.7bp/5d (t = 4.18), +29.8bp/21d
+  (t = 3.45) — the numbers that looked loud in the atlas.
+- **Null family-max |t|: median 2.54, 95th percentile 3.58.** The observed 3.45 does
+  not clear the bar: **selection-adjusted p = 0.073**. Being the loudest of 54
+  statistics, a t of 3.45 is unremarkable.
+- **Era stability: FAIL** — 21d cell means by year: −22.6 / +13.9 / −27.5 / +35.1 /
+  +49.3 bp (2016→2020). The "effect" is two good late years, not a structure.
+- Net economics context (+14.8bp/21d after 15bp RT) is moot given the above.
+
+**REGISTERED VERDICT: FAIL.** The registered prior ("dies like every searched cell,
+per the Phase 4 precedent") is confirmed. The cell is recorded as atlas-noise; no
+variants, no neighboring cells. This is now the third time a "found" conditional cell
+died against a selection-honest null in this project — the atlas's graduation rule
+works as designed.

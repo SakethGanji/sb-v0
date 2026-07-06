@@ -91,3 +91,32 @@ three ways.
   BLEND = sqrt(RV·VIX), i.e. to a crude implied-vol blend, before any option spread
   was paid.
 - Step 4 — seal after 2 (and 3 or its explicit decline).
+
+---
+
+## §A2 — orthogonal microstructure invariants → **2 of 3 properties EXIST**
+
+Pre-registration `phase7a2-preregistration.md` (frozen before build). Build:
+`scripts/phase7a2_build_profiles.py` (volume_profile_daily, 1,151 days from
+bars_1m_raw, ~4 min); tests: `scripts/phase7a2_property_tests.py` (train universe,
+928,589 stock-days). PASS floor: residual rank-AC ≥ 0.10 shortest horizon, clustered
+CI excluding 0, sign-stable 5/5 eras. All measures residualized per date on the vol
+block (8 STATIC_VOL) + liquidity block (adv/addv), as ranks.
+
+| test | shortest-horizon residual rank-AC | eras | verdict |
+|---|---|---|---|
+| A2a volume-profile HHI | +0.070 ± 0.001 (t+1), +0.042 (t+21) | 5/5 stable | **FAIL** — real but below the 0.10 floor: decorative |
+| A2b Hill tail index (up) | +0.290 ± 0.011 (month) | 5/5 stable | **PASS** (gate: MDE 0.014, answerable) |
+| A2b Hill tail index (down) | +0.268 ± 0.012 (month) | 5/5 stable | **PASS** |
+| A2c avg dollar trade size | +0.724 ± 0.001 (t+1), +0.556 (t+21) | 5/5 stable | **PASS** |
+
+Reading: beyond volatility, price/volume microstructure carries at least two more
+persistent per-stock invariants — **who trades it (trade-size fingerprint, AC 0.72)**
+and **how it jumps (tail shape, AC ~0.28 both tails, against a registered weak/none
+prior)**. Volume-profile concentration is mostly absorbed by ADV as suspected.
+**Monetization map (frozen, unchanged):** these route ONLY to a Branch B extension —
+a registered comparison of our tail/concentration knowledge vs option-implied
+skew/smile — and raise Step 3's priority. No delta-one implication exists or is
+claimed. First run of the A2 tests hit the polars NaN-vs-null footgun (NaN residual
+ranks passing `drop_nulls()`), fixed same-day; the wrong run printed all-NaN, so no
+result was ever mis-read.
