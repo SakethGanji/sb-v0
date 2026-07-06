@@ -18,6 +18,9 @@ data/
 __pycache__/
 *.pyc
 
+# Scratch run logs from analysis scripts
+scripts/_*.log
+
 # IDE
 .idea/
 .vscode/
