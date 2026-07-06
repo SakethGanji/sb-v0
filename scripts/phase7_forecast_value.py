@@ -14,8 +14,10 @@ The one question, three arms:
     Arm C: volatility-harvest basket — harvest(ML top decile) vs harvest(ATR14 top decile)
 
 Registered expectation: NULL on all arms (forecast lift over persistence is +0.0076 IC).
-PASS per arm: 95% joint-block-bootstrap CI of ΔSharpe or Δlog-growth (ML − naive) excludes
-0 in ML's favor against EVERY naive baseline in the arm. OOS 2018-2020 only.
+PASS per arm = ECONOMIC UTILITY AT MATCHED RISK, never return: 95% joint-block-bootstrap
+CI of ΔSharpe (scale-invariant) or Δlog-growth AT COMMON REALIZED VOL (both series
+rescaled to 10% ann.) excludes 0 in ML's favor against EVERY naive baseline in the arm.
+A PASS is a risk tool, not a trading edge. OOS 2018-2020 only.
 
 Run: scripts/phase7_forecast_value.py [--arm A|B|C]   (default: all)
 """
@@ -136,14 +138,22 @@ def diff_ci(ra, rb, rng, metric):
     return float(np.quantile(d, 0.025)), float(np.quantile(d, 0.975))
 
 
+def vol_match(r, target=0.10):
+    """rescale a net return series to a common realized vol so growth comparisons are
+    at equal risk (a biased-low forecast can't win growth by just running hotter).
+    Full-sample scalar rescale — noted approximation for the bootstrap."""
+    sd = r.std(ddof=1) * np.sqrt(ANN)
+    return r * (target / sd) if sd > 0 else r
+
+
 def verdict_line(name, r_ml, r_nv, rng):
     sh_m, g_m, dd_m = stats(r_ml); sh_n, g_n, dd_n = stats(r_nv)
     slo, shi = diff_ci(r_ml, r_nv, rng, "sharpe")
-    glo, ghi = diff_ci(r_ml, r_nv, rng, "growth")
+    glo, ghi = diff_ci(vol_match(r_ml), vol_match(r_nv), rng, "growth")  # matched-risk growth
     ok = slo > 0 or glo > 0
     print(f"  {name:<34} Sharpe {sh_m:5.2f} vs {sh_n:5.2f}  ΔSh CI[{slo:+.2f},{shi:+.2f}]"
-          f"  Δg CI[{glo*100:+.2f}%,{ghi*100:+.2f}%]/yr  maxDD {dd_m*100:5.1f}/{dd_n*100:5.1f}%"
-          f"  -> {'ml-better' if ok else 'null'}")
+          f"  Δg@10%vol CI[{glo*100:+.2f}%,{ghi*100:+.2f}%]/yr  maxDD {dd_m*100:5.1f}/{dd_n*100:5.1f}%"
+          f"  -> {'ml-better (risk tool)' if ok else 'null'}")
     return ok
 
 
@@ -191,12 +201,15 @@ def arm_a(rng):
         sig_lag = np.concatenate([[np.nan], sig[:-1]])
         w = np.nan_to_num(np.minimum(1.0, SIGMA_STAR / sig_lag), nan=1.0)
         turn = np.abs(np.diff(np.concatenate([[w[0]], w])))
-        return (w * ret - turn * COST_SPY)[oos]
+        return (w * ret - turn * COST_SPY)[oos], float(w[oos].mean())
 
-    r_ml = overlay(pred)
+    r_ml, w_ml = overlay(pred)
     passes = []
     for nm, s in [("RV21", rv21), ("BLEND", np.sqrt(np.clip(rv21, 1e-8, None) * np.clip(vix, 1e-8, None)))]:
-        passes.append(verdict_line(f"ML vs {nm}", r_ml, overlay(s), rng))
+        r_nv, w_nv = overlay(s)
+        print(f"  avg exposure ⟨w⟩: ML {w_ml:.2f} vs {nm} {w_nv:.2f}"
+              + ("  [exposure gap >0.05 — disclose with verdict]" if abs(w_ml - w_nv) > 0.05 else ""))
+        passes.append(verdict_line(f"ML vs {nm}", r_ml, r_nv, rng))
     ok = all(passes)
     print(f"  ARM A verdict: {'PASS (risk-tool)' if ok else 'NULL'} (must beat every baseline)")
     return ok

@@ -47,6 +47,18 @@ the §7.7 confirmation protocol before belief.
   survives all baselines in its arm counts at all, and belief further requires 2021-22
   per protocol.
 
+> **Amended 2026-07-06 (pre-run — frozen before any result was seen; data not yet
+> available to this session).** The PASS criterion is *economic utility at matched
+> risk*, never return: better realized Sharpe / drawdown / geometric growth **at equal
+> risk** versus the naive-trailing-vol version of the same portfolio. Concretely:
+> ΔSharpe is scale-invariant and stands as-is; **Δlog-growth is compared after both
+> net return series are rescaled to a common realized volatility** (10% annualized),
+> so a forecast that merely runs systematically higher average exposure in a bull
+> window cannot manufacture a growth PASS. Average exposure ⟨w⟩ is reported per
+> strategy and any material gap is disclosed with the verdict. A PASS under this
+> criterion is a **risk tool, not a trading edge** — restating, with teeth, what the
+> cell claim already made unavailable.
+
 ## Arm A — vol-targeted SPY: ML σ̂ vs naive σ̂ (time-series)
 
 - ML σ̂_t: HistGB regression, features = market-level knowables through t−1

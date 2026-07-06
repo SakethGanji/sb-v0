@@ -38,6 +38,13 @@ scripts/phase7_forecast_value.py            # all arms; or --arm A|B|C
   atr_14d. Arm C: harvest(ML basket) vs harvest(ATR basket).
 - The script resolves the `forward_outcomes` next-day-return column defensively and
   prints its choice; record any contract substitution verbatim in the findings doc.
+- **PASS criterion (economic utility, never alpha):** better realized Sharpe /
+  drawdown / geometric growth **at equal risk** versus the naive-trailing-vol version
+  of the same portfolio — ΔSharpe is scale-invariant; Δgrowth is compared with both
+  return series rescaled to a common 10% realized vol, and average exposure is
+  reported, so higher exposure in a bull window cannot masquerade as forecast value.
+  **A PASS means "better risk tool," never "trading edge"** (pre-registration,
+  pre-run amendment of 2026-07-06).
 - **Decision rule (frozen):** NULL on all arms → the forecast is persistence-in-a-
   costume for every portfolio use; Channel G closes at the margin; naive trailing vol
   remains the recommended risk input. Any arm PASS → risk-tool verdict only → run the
