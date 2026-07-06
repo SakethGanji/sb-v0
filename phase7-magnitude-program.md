@@ -161,7 +161,7 @@ the equity premium, not ours. These can never be "alpha" but are legitimate engi
 |---|---|---|---|
 | G1 | Vol-targeted index exposure | cut σ in high-vol states, μ mostly survives | TESTED — Phase 5: 12/12 Sharpe up, maxDD −50–82%, 0/12 provable as return edge. Standing verdict: use if drawdowns matter; not alpha. |
 | G2 | Cross-sectional inverse-vol / risk-parity weighting of a stock portfolio | equalize risk contributions → higher portfolio Sharpe by diversification math | Known beta (low-vol tilt = door 6's factor, which lives in the illiquid corner). The only *new* question is **G2′ below**. |
-| G2′ | **Marginal value of OUR magnitude forecast over trailing vol** for G1/G2 weights | if the ML forecast (RV IC 0.612) beats naive persistence (0.576) *enough*, weights improve measurably | **OPEN — the one cheap, honest delta-one-adjacent test left.** Written prior: ~null (the entire lift is +0.0076 rank-IC). Pre-registered as Test 7.1. |
+| G2′ | **Marginal value of OUR magnitude forecast over trailing vol** for G1/G2 weights | if the ML forecast (RV IC 0.612) beats naive persistence (0.576) *enough*, weights improve measurably | **OPEN — the one cheap, honest delta-one-adjacent test left.** Written prior: ~null (lift over persistence +0.036 rank-IC; the oft-quoted +0.0076 is over the informed baseline — pre-reg amendment v2 correction). Pre-registered as Test 7.1. |
 | G3 | Volatility-harvesting rebalancing (Shannon's-demon) among top-decile predicted-magnitude names | diversification return scales with σ²; predicted-high-σ basket maximizes it | OPEN in principle, but the mechanism pays *geometric* not arithmetic return, is already captured by any fixed-weight rebalanced portfolio, and the harvest (≈σ²/2 per period on the traded fraction) must beat round-trip costs on the *highest-spread* names. Folded into Test 7.1 as a secondary arm rather than its own program. |
 | G4 | Kelly / dynamic leverage on predicted magnitude | same math as G1 with leverage | CLOSED as duplicate of G1 (no-leverage constraint binds at retail anyway). |
 
@@ -169,7 +169,7 @@ the equity premium, not ours. These can never be "alpha" but are legitimate engi
 
 | # | Family | Mechanism | Status |
 |---|---|---|---|
-| C1 | Long straddle/strangle where forecast RV > IV | buy underpriced realized variance | **OPEN = Branch B.** Requires ~$50–100 of IV history. Written prior: poor (+0.008 forecast lift over persistence, and persistence IS the market's own first input). Power gate first. |
+| C1 | Long straddle/strangle where forecast RV > IV | buy underpriced realized variance | **OPEN = Branch B.** Requires ~$50–100 of IV history. Written prior: poor (+0.0076 forecast lift over the informed baseline, +0.036 over raw persistence — and IV embeds more than persistence). Power gate first. |
 | C2 | Short premium where IV > forecast RV | sell overpriced variance | Same test, other tail — but pre-labeled GATED (margin, assignment, tail risk = wall-class) exactly like short-side equity findings. Measured for the record if Branch B data is bought; not deployable at retail regardless. |
 | C3 | "Synthetic gamma" — delta-one rebalancing to replicate option convexity | gamma-scalp without options | **CLOSED by identity**: rebalancing P&L nets to (realized variance × traded notional) *minus the same trading costs*, with no option premium received/paid on the other side. Without an options counterparty it is Channel G3 in disguise; with one it is C1/C2. It is a re-representation, exactly the class the prompt asked to eliminate. |
 
@@ -236,9 +236,10 @@ top-decile predicted-magnitude names vs buy-and-hold same basket (the G3 harvest
 **Estimands:** ΔSharpe, Δlog-growth, ΔmaxDD (ML − naive), block-bootstrap CIs.
 **PASS (risk-tool):** ML beats naive with CI excluding 0 on ΔSharpe or Δgrowth.
 **PASS (alpha): not available to this design by construction — pre-declared.**
-**Registered null expectation:** ML ≈ naive (the entire forecast lift over persistence is
-+0.0076 rank-IC; persistence is already in the naive weights). Either way the "our
-forecast is special" question ends with a number.
+**Registered null expectation:** ML ≈ naive (the forecast lift over trailing-vol
+persistence is +0.036 rank-IC — pre-reg amendment v2 corrected the v1 "+0.0076" figure,
+which is the lift over the informed baseline; persistence is already in the naive
+weights). Either way the "our forecast is special" question ends with a number.
 
 ### Test 7.2 — Branch B: realized vs implied (paid, ~$50–100, one month of IV history)
 **Cell:** Channel C (hatch H2). Exactly as specified in `FINAL_REPORT.md` §8 and

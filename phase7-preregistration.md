@@ -11,8 +11,11 @@ alpha verdict** — its only available PASS is "risk-tool improved." Pre-declare
 
 Everything "magnitude" can do at the portfolio level, naive trailing volatility already
 does (that is what Phase 5 used). The ONLY thing our months of ML work added is a
-forecast whose lift over persistence is **+0.0076 rank-IC** (0.604 informed → 0.612
-full-ML, `phase1_vol_forecast.py`). Test 7.1 asks, once, in economic units:
+forecast whose lift over trailing-vol persistence is **+0.036 rank-IC** (0.576
+persistence → 0.604 informed → 0.612 full-ML, `scripts/_vol_forecast.log`).
+*(Amendment v2 correction: the v1 text said "+0.0076 over persistence"; +0.0076 is the
+full-ML lift over the INFORMED baseline. The registered null expectation stands,
+recalibrated to the honest number.)* Test 7.1 asks, once, in economic units:
 
 > **Does the full-ML magnitude forecast improve any volatility-managed portfolio over
 > the SAME portfolio built on naive trailing vol?**
@@ -81,11 +84,18 @@ the §7.7 confirmation protocol before belief.
 - ML σ̂ per (day, stock): the Phase 1 FULL-ML forecast of realized 1d range
   (identical features/model/walk-forward/embargo to `phase1_vol_forecast.py`),
   computed once and reused by Arm C.
-- Naive σ̂: **atr_14d** (the persistence baseline in the same range-like units).
+- Naive σ̂: **atr_14d / entry_price** (the persistence baseline in the same fractional
+  range units as the forecast target; amendment v2 — the dataset's `atr_14d` is in
+  DOLLARS, so raw inverse-ATR would be inverse-price weighting, a strawman biased
+  toward a false ML PASS).
 - Portfolio: rebalance every 21 trading days; weights ∝ 1/σ̂ normalized; holdings
-  drift within the block (compounded daily via per-stock next-day returns at the 10:00
-  clock); names whose returns disappear mid-block (delist) contribute their last value
-  at 0 further return, logged. Cost charged on one-way turnover at each rebalance:
+  drift within the block (compounded daily via per-stock 10:00→10:00 returns
+  **entry_price(D+1)/entry_price(D) − 1**; amendment v2 — `ret_1d` spans
+  entry(D)→close(D+1), OVERLAPPING across days, and cannot be compounded; the derived
+  entry-to-entry return is disjoint, adjusted-basis, price-only, dividends excluded
+  identically for both strategies); names whose returns disappear mid-block
+  (delist/coverage gap) contribute their last value at 0 further return, counted and
+  reported in the run log. Cost charged on one-way turnover at each rebalance:
   15bp × ½·Σ|w_new − w_drifted|.
 - Comparators: (i) **inverse-ATR14** — the registered marginal question; (ii)
   **equal-weight** — descriptive context only (whether inverse-vol beats EW is a known
@@ -114,3 +124,57 @@ the §7.7 confirmation protocol before belief.
 - No expectancy claims from any arm, PASS or not.
 - If data-contract mismatches force column-name substitutions at run time, they are
   recorded in the findings doc verbatim; no other deviation is permitted silently.
+
+---
+
+## Amendment v2 — 2026-07-06, PRE-RUN (frozen before any registered result was seen)
+
+An 8-angle code review of `scripts/phase7_forecast_value.py` (run on the data machine,
+findings verified empirically against the parquet files) found the v1 script could not
+execute Arm A and would not have measured the registered question in Arms B/C. All
+fixes below were made **before the first registered run**; the registered questions,
+estimands, PASS/FAIL logic, splits, costs, and null expectations are unchanged. The
+2018–2020 OOS window was not unblinded during the fix (the only execution before the
+registered run is a `--smoke` engineering pass on 2017 pseudo-OOS, train-2016 — a year
+outside the registered evaluation, with no verdict semantics).
+
+Data-contract corrections (empirically verified):
+1. **Returns.** `forward_outcomes.ret_1d` = entry(10:00 D)→close(D+1) — overlapping
+   across days, not compoundable. Arms B/C now use the disjoint 10:00→10:00 return
+   `entry_price(D+1)/entry_price(D) − 1` (adjusted basis; price-only; dividends
+   excluded identically for both strategies). The v1 candidate-name fallback list for a
+   "next-day return column" is deleted — no such disjoint column exists in the dataset.
+2. **Baseline units.** `atr_14d` is in dollars (median ≈ $0.45; raw rank-IC on the
+   fractional range target is 0.0397). The Arm B/C naive signal is now
+   `atr_14d / entry_price`.
+3. **Prior miscalibration.** "+0.0076 over persistence" corrected to +0.036 over
+   persistence (+0.0076 is over the informed baseline). Null expectation unchanged.
+
+Methodology corrections (all tightening, none result-contingent):
+4. **Embargo** is now counted in trading days (v1 used calendar days, which let Arm A
+   training labels reach into the test year at every fold boundary).
+5. **Arm A model** gets a frozen small-sample config (max_leaf_nodes=7,
+   min_samples_leaf=20, validation_fraction=0.15): the cross-sectional config
+   (min_samples_leaf=200) cannot produce a single split on the ~350-row first fold,
+   i.e. the v1 "ML σ̂" would have been a constant. σ̂ dispersion is printed as a
+   degeneracy check. The XS model keeps phase1's exact seed (20260705) so "identical
+   model" is literally true; bootstrap seed stays 20260706.
+6. **Paired NaN policy (Arm A).** v1 mapped a missing σ̂ to FULL exposure (w=1)
+   silently. Now: evaluation days are the intersection where ML, RV21 and BLEND all
+   have finite lagged σ̂ (count printed); a wholly missing baseline input (e.g. no
+   vix_close) is a fatal error, not a silent buy-and-hold strawman.
+7. **Matched-risk growth CIs** are vol-matched per bootstrap replicate (v1 rescaled
+   once on the full sample, letting vol differences leak back into the CI). Arm C's
+   registered Δharvest is now computed on matched streams: both legs of each basket are
+   levered by one scalar k = 10% / realized vol(buy-hold leg) before the log-growth
+   difference, so a hotter basket cannot win on σ² alone — this applies the v1
+   matched-risk amendment to Arm C, which the v1 script omitted.
+8. **Delist/coverage-gap accounting** is counted and reported; the Arm C rebalanced leg
+   freezes dead names out of its re-equalization target (v1 kept "buying" them and
+   charging turnover); block-boundary turnover still writes off dead positions
+   conservatively. Exposure/uninvested-day diagnostics are printed for Arms B/C.
+9. **Per-arm RNG streams** (`default_rng([20260706, arm])`) so `--arm B` reproduces the
+   full run's CIs bit-for-bit (v1 consumed one shared stream sequentially).
+10. **Loud contracts:** duplicate-column crash in Arm A's feature list fixed; expected
+    feature columns that are absent are printed (v1 dropped them silently); the last
+    OOS day is no longer silently untraded when the day count is ≡1 mod 21.

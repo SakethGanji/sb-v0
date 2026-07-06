@@ -26,8 +26,9 @@ with a PASS routed through the confirmation protocol. Nothing else gets run.
 
 ## Step 1 — RUN Test 7.1 (now; free; one overnight on the data machine)
 
-**What:** `scripts/phase7_forecast_value.py` (written, syntax-checked, pushed).
-Pre-registration frozen in `phase7-preregistration.md`. Cell: Channel G / hatch H1.
+**What:** `scripts/phase7_forecast_value.py` (written, reviewed against the live data
+contracts, fixed under pre-run **amendment v2** — see `phase7-preregistration.md` —
+and smoke-tested on 2017 pseudo-OOS). Cell: Channel G / hatch H1.
 
 ```
 cd <repo on data machine>
@@ -35,9 +36,11 @@ scripts/phase7_forecast_value.py            # all arms; or --arm A|B|C
 ```
 
 - Arm A: vol-targeted SPY, ML σ̂ vs RV21/BLEND. Arm B: inverse-vol portfolio, ML vs
-  atr_14d. Arm C: harvest(ML basket) vs harvest(ATR basket).
-- The script resolves the `forward_outcomes` next-day-return column defensively and
-  prints its choice; record any contract substitution verbatim in the findings doc.
+  atr_14d/price. Arm C: harvest(ML basket) vs harvest(ATR basket).
+- Data contracts are pinned, not guessed (amendment v2): portfolio returns are the
+  disjoint 10:00→10:00 `entry_price` ratio (`ret_1d` overlaps across days and cannot
+  be compounded); the naive baseline is `atr_14d / entry_price` (dollar ATR is a
+  strawman); any remaining contract deviation at run time is fatal, not silent.
 - **PASS criterion (economic utility, never alpha):** better realized Sharpe /
   drawdown / geometric growth **at equal risk** versus the naive-trailing-vol version
   of the same portfolio — ΔSharpe is scale-invariant; Δgrowth is compared with both
