@@ -68,3 +68,15 @@ is the cheapest sharp directional test) or index.
 scripts/phase2_momentum_breakdown.py · scripts/phase2_reversal_verify.py
 scripts/phase2_green_survival.py · scripts/phase3_lifecycle.py
 ```
+
+## D. Bayesian update — P(win | positive evidence) vs remaining expectancy (`phase3_bayesian_update.py`)
+The clean conditional-probability test (SUCCESS states stacked, not failure states), with SPY's
+intraday path joined for true relative-strength and excess-remaining.
+- **P(win) updates for real:** green→up→stacked evidence lifts P(win) 50% → ~85% (up>1% @60m 84.6%;
+  full STACK grn+VWAP+RS+RVOL @60m 81.7%); P(never revisit entry) → 81%. Bayesian intuition confirmed.
+- **But remaining expectancy ~0, even for the max stack:** excess-over-SPY remaining is within ±1.5bp
+  of zero everywhere and NEGATIVE net of cost (STACK excRem: 5m −1.8, 30m +0.9, 60m +0.2). The high
+  P(win) is **banked gains, not a hold edge** — the user's own caveat, confirmed.
+- Sub-findings: high-RVOL alone leaves P(win) at 50.5% (volume = magnitude, not direction); the only
+  positive flicker is extreme early movers (up>1%) with +2.5..+4.6bp excess-remaining at 10-30m
+  (faint intraday continuation, small-n, negative net of cost).
