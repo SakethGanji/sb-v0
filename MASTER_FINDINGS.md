@@ -1,8 +1,8 @@
 # MASTER FINDINGS — Price/Volume Alpha Research (consolidated)
 
-**Updated:** 2026-07-06 · Consolidates Phase 0 → Phase 3. This is the single-page record of
-what the whole project discovered, with exact numbers. Per-step detail in the `phase*-findings.md`
-docs and `PHASE1_CHARACTERIZATION.md`; scripts in `scripts/phase*_*.py`.
+**Updated:** 2026-07-06 (evening: +Phase 4) · Consolidates Phase 0 → Phase 4. This is the
+single-page record of what the whole project discovered, with exact numbers. Per-step detail in
+the `phase*-findings.md` docs and `PHASE1_CHARACTERIZATION.md`; scripts in `scripts/phase*_*.py`.
 
 ---
 
@@ -78,6 +78,17 @@ and money not lost to an overfit backtest.
 
 ---
 
+### Phase 4 — Branch A executed at $0 + the conditional-subset door → BOTH NULL
+| Test | Result |
+|---|---|
+| Power gate (new discipline: run BEFORE the test) | phase-1 daily-decile design MDE95 **38–44bp** (can't adjudicate the long leg); pooled calendar-time top-quintile design MDE95 **~23bp**; verdict rule pre-registered |
+| EDGAR pipeline ($0) | FIGI→CIK via `display_symbol_on_day` **98.6%** match · 431k as-filed EPS facts · 59.9k PIT SUE (same-filing seasonal diff = split-immune) · 97k 8-K item-2.02 events |
+| **CLOCK DISCOVERY** | dataset earnings dates are 10-Q/K **FILING** dates (filed−event ≈ 0d); press release is 0–14+d earlier → all prior earnings conditioning was on a late clock; true clock now in `edgar_8k_events.parquet` |
+| True-SUE PEAD, filing clock | top-quintile long leg **−5.1bp gross**, placebo ~0; SUE decile spread **+8.6** vs proxy's +58.9 → the proxy spread was reaction-magnitude sorting |
+| True-SUE PEAD, corrected 8-K clock | SUE is REAL at the event (quintile event-window swing **−43 → +72bp**, monotone) but **fully priced within ~1 day**: earliest-safe entry long leg **+5.5 gross / −9.5 net@15** CI[−28.8,+10.2]; all windows null → real-but-already-priced |
+| GBM score-tail (top 5/1/0.5/0.1% of joint-probe OOS scores) | nominal net grows to **+33bp @0.1%** but win rate **~50% at every tail** (pure skew: avg win +809 vs loss −702), day-clustered CI **[−107,+189]**, 2018 negative → **vol mirage #5** |
+| PRIM subgroup search (pre-registered, 25-perm full-pipeline null) | train boxes 62–65% win / +48–105bp net collapse OOS to 41–58% / −130…+11bp; best valid OOS **−31.6bp net** vs null 95pct **+12.7** → **inside the null**; **zero ≤4-condition box ever qualified in-sample** (real or any of 50 perm runs) |
+
 ## 3. The recurring theme: 4 real-but-uncapturable structures
 
 Every genuine structure found is real gross and dies at a wall:
@@ -107,15 +118,21 @@ Direction is only ever predictable by conditioning on **why** a stock moves (the
 
 ---
 
-## 6. Forward path (Phase 3 decision)
+## 6. Forward path (updated after Phase 4)
 
-The dataset is exhausted for a long-only price/volume stock edge. Two doors, both need NEW data:
-- **Branch A — directional data (top lead).** Real earnings-surprise (SUE) + analyst revisions
-  (e.g. FMP, ~hundreds/yr). **Cheapest sharp test:** re-run PEAD with a true SUE, target the long
-  leg net of cost. Higher prior because the price-proxy PEAD already gives a clean drift.
-- **Branch B — options/IV (downgraded).** The vol signal is ~persistence; only worth a ThetaData/ORATS
-  slice if a delta-hedged straddle shows realized > implied net of the option spread.
-- **Baseline to beat: just index.** The honest default if the cheap directional test is null.
+- **Branch A — EXECUTED at $0 and NULL** (see Phase 4 table). The "cheapest sharp test" was
+  run with a free time-series SUE from EDGAR: the surprise is real at the event and priced
+  within ~1 day. Buying consensus data (FMP) is now a long shot with a concrete bar: it must
+  find **≥ ~25bp/5d net@15** in the top quintile where time-series SUE found **−9.5**.
+  Recommendation: **don't buy** unless that bar is accepted as the explicit bet.
+- **Conditional-subset door — CLOSED with evidence** (score-tail + PRIM + permutation null;
+  `phase4-conditional-subset-findings.md`). No further price/volume conditional searches.
+- **Branch B — options/IV (unchanged, downgraded).** Only worth a slice if a delta-hedged
+  straddle shows realized > implied net of spread; the vol signal being ~persistence says no.
+- **Baseline: just index.** This is now the standing default, not a fallback.
+- Free residual assets if ever wanted: the EDGAR pipeline generalizes to guidance/8-K text,
+  Form 4 insider filings, filing-lag signals — different *information*, same machinery. Each
+  would need its own power gate first.
 
 ---
 
@@ -123,6 +140,8 @@ The dataset is exhausted for a long-only price/volume stock edge. Two doors, bot
 
 **Docs:** `PHASE1_CHARACTERIZATION.md` · `phase1-*-findings.md` (power-mde, tracer, cost-model,
 blacklist, validation, ceiling, stability, sweep, dp, factor, metalabel, frontier) ·
-`phase2-findings.md` · `phase3-findings.md` · `phase1-research-strategy.md` (frozen plan).
-**Scripts:** `scripts/phase1_*.py` (18) · `scripts/phase2_*.py` (5) · `scripts/phase3_*.py` (2).
-**Outputs:** `data/phase1_analysis/*.parquet`. **Data:** `data/outputs/` (8 tables).
+`phase2-findings.md` · `phase3-findings.md` · `phase4-findings.md` (true-SUE PEAD + clock) ·
+`phase4-conditional-subset-findings.md` (PRIM + score-tail) · `phase1-research-strategy.md`.
+**Scripts:** `scripts/phase1_*.py` (18) · `scripts/phase2_*.py` (5) · `scripts/phase3_*.py` (2) ·
+`scripts/phase4_*.py` (8). **Outputs:** `data/phase1_analysis/*.parquet` (+ `edgar_*.parquet`).
+**Data:** `data/outputs/` (8 tables) · `/mnt/atlas/edgar/` (bulk zips).
