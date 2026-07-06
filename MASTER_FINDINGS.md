@@ -96,6 +96,12 @@ and money not lost to an overfit backtest.
 | Long-horizon momentum power gate (12-1/6-1 × 21/42/63d) | **FAIL — unanswerable**: MDE95 56–168bp vs plausible 10–90bp; 252d lookback leaves ~14 independent 63d obs; test not run, no claim either way |
 | Insider cluster-buying (Form 345, 96.8k open-market purchases, $0) | gate MARGIN (MDE ~75bp) · registered LONG hypothesis **NULL** · post-hoc surprise: CLUSTER **−81.4bp/21d** CI[−155,−5], and **−85.4 CI[−141,−31] vs decline-matched controls** — insiders bought falling knives and were wrong; **short-gated, suggestive-only** (candidate wall #6) |
 
+### Phase 6 — event-conditioned state dynamics (pre-registered) → confirms the null
+| Test | Result |
+|---|---|
+| Frozen k=6 states (train-fit 2016-18) | centroids = vol/liquidity/trend regimes (quiet 31% … explosion 4.8%); persistence 0.73–0.90; OOS transition drift max **0.033** (rule <0.10) → **stable = GARCH rediscovered**, exactly as pre-registered |
+| Event × state cells (4 events × 6 states × 2 horizons) | **42/48 cells UNANSWERABLE** by power gate; BY-FDR over the 6 answerable: **0 survive**; nearest misses negative (generic-8-K-in-quiet-state −29bp/5d raw) = short-gated + era-unstable → interaction branch does NOT open |
+
 ## 3. The recurring theme: 4 real-but-uncapturable structures
 
 Every genuine structure found is real gross and dies at a wall:
