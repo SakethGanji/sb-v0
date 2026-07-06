@@ -254,6 +254,13 @@ Channel E needs no test (theorem + five measured confirmations). Channel X is
 entitlement-gated. Anything else proposed must name a cell (§4 step 1), and there are no
 unclaimed cells.
 
+> **Amended 2026-07-06 (late):** one addition adopted after review of an external
+> roadmap — the **A2 property sprint** (liquidity-concentration persistence, tail-shape
+> persistence; property tests only, vol/liquidity-orthogonalized, monetization map
+> pre-committed to Branch B or nothing). It is science, not a candidate edge, and does
+> not alter the terminal character of the queue. Full sequencing now lives in
+> `phase7-implementation-plan.md`, which governs execution.
+
 ---
 
 ## 6. The exhaustion statement (what we may claim, and when)
