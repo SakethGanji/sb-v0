@@ -89,6 +89,13 @@ and money not lost to an overfit backtest.
 | GBM score-tail (top 5/1/0.5/0.1% of joint-probe OOS scores) | nominal net grows to **+33bp @0.1%** but win rate **~50% at every tail** (pure skew: avg win +809 vs loss −702), day-clustered CI **[−107,+189]**, 2018 negative → **vol mirage #5** |
 | PRIM subgroup search (pre-registered, 25-perm full-pipeline null) | train boxes 62–65% win / +48–105bp net collapse OOS to 41–58% / −130…+11bp; best valid OOS **−31.6bp net** vs null 95pct **+12.7** → **inside the null**; **zero ≤4-condition box ever qualified in-sample** (real or any of 50 perm runs) |
 
+### Phase 5 — the free queue emptied (vol-targeting, momentum gate, insiders)
+| Test | Result |
+|---|---|
+| Vol-targeted SPY (4 signals × 3 rules, no leverage, 2bp) | **all 12 configs**: Sharpe +0.13…+0.64, maxDD −50…−82% (best −6.4% vs −34.6% through COVID) — but every ΔSharpe CI includes 0 and the payoff is insurance-shaped (wins only 2018/2020) → **real risk overlay, unprovable alpha**; 0/12 formal PASS |
+| Long-horizon momentum power gate (12-1/6-1 × 21/42/63d) | **FAIL — unanswerable**: MDE95 56–168bp vs plausible 10–90bp; 252d lookback leaves ~14 independent 63d obs; test not run, no claim either way |
+| Insider cluster-buying (Form 345, 96.8k open-market purchases, $0) | gate MARGIN (MDE ~75bp) · registered LONG hypothesis **NULL** · post-hoc surprise: CLUSTER **−81.4bp/21d** CI[−155,−5], and **−85.4 CI[−141,−31] vs decline-matched controls** — insiders bought falling knives and were wrong; **short-gated, suggestive-only** (candidate wall #6) |
+
 ## 3. The recurring theme: 4 real-but-uncapturable structures
 
 Every genuine structure found is real gross and dies at a wall:
@@ -129,10 +136,11 @@ Direction is only ever predictable by conditioning on **why** a stock moves (the
   `phase4-conditional-subset-findings.md`). No further price/volume conditional searches.
 - **Branch B — options/IV (unchanged, downgraded).** Only worth a slice if a delta-hedged
   straddle shows realized > implied net of spread; the vol signal being ~persistence says no.
-- **Baseline: just index.** This is now the standing default, not a fallback.
-- Free residual assets if ever wanted: the EDGAR pipeline generalizes to guidance/8-K text,
-  Form 4 insider filings, filing-lag signals — different *information*, same machinery. Each
-  would need its own power gate first.
+- **Baseline: just index.** This is now the standing default, not a fallback. Optional:
+  the vol-targeting overlay (Phase 5) if drawdowns matter — risk tool, not alpha.
+- **The free queue is EMPTY as of Phase 5** (momentum timeline unanswerable; insider
+  long-edge null, short-side suggestive but gated). Remaining moves: fund Branch B
+  (~$50–100/mo, one pre-registered month) or write the final report and seal.
 
 ---
 
