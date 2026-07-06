@@ -142,6 +142,12 @@ Direction is only ever predictable by conditioning on **why** a stock moves (the
   `phase4-conditional-subset-findings.md`). No further price/volume conditional searches.
 - **Branch B — options/IV (unchanged, downgraded).** Only worth a slice if a delta-hedged
   straddle shows realized > implied net of spread; the vol signal being ~persistence says no.
+- **Test 7.1 (Phase 7) — EXECUTED at $0 and NULL on all 3 arms** (2026-07-06,
+  `phase7-findings.md` §7.1): the ML magnitude forecast adds nothing over naive trailing
+  vol as a portfolio risk input (Arm B ΔSharpe CI [−0.02,+0.04]; Arm A's market-level ML
+  RMSE loses to RV21 and to BLEND=√(RV·VIX) outright). Channel G closed at the margin;
+  **the risk input for the Phase 5 overlay is RV21/BLEND, no ML needed**. Extra prior
+  against Branch B: our forecast already lost to a crude implied-vol blend for free.
 - **Baseline: just index.** This is now the standing default, not a fallback. Optional:
   the vol-targeting overlay (Phase 5) if drawdowns matter — risk tool, not alpha.
 - **The free queue is EMPTY as of Phase 5** (momentum timeline unanswerable; insider
