@@ -2,8 +2,41 @@
 
 **Date:** 2026-07-06 · Governs Phase 7 Step 3. This is the plan and the
 pre-registration SKELETON; the formal freeze (`branchB-preregistration.md`) happens
-at purchase, before any IV data is opened, with only data-contract blanks filled in.
-**Status: awaiting the funding decision — the only paid step in the project.**
+before any IV data is opened, with only data-contract blanks filled in.
+
+## STATUS 2026-07-07 — DATA ACCESS ACQUIRED, hooked up, nothing unblinded
+
+- **Purchased:** ORATS **Delayed Data API** ($99/mo, **20,000 requests/month**,
+  15-min delay — irrelevant, we use hist EOD endpoints only). History coverage
+  verified via metadata call: 2007-01-03 → present.
+- **Access:** token in `~/.orats_token` (mode 600, NOT in repo; if it ever needs
+  rotating, the ORATS dashboard reissues it and only that file changes). Base URL
+  `https://api.orats.io/datav2`, auth via `token` query param. Client helper:
+  **`scripts/orats_client.py`** (tested; retry/backoff; reads the token file).
+- **`@orats/cli` v1.1.0 is broken upstream** (its `incur` dep imports
+  `StdioServerTransport` from `@modelcontextprotocol/server`, which no published
+  version exports — tried beta.2 and alpha.4). Uninstalled; the REST path via the
+  client helper is the supported route. Revisit the CLI/MCP only if they fix it.
+- **Request budget (20k/mo, binding constraint of the tier):** per-ticker
+  hist range calls for `hist/smvsummaries` + `hist/monies/implied` over ~700
+  tickers ≈ 1.4–3k requests (chunk by year if response caps bite → ≤ 6k). Strikes
+  history is the expensive one — pull it ONLY for the straddle/spread audit on a
+  pre-registered SAMPLE (e.g. 100 names × month-ends ≈ 3.6k requests), not the full
+  panel. Log request counts in the downloader; abort at 15k used.
+- **Discipline unchanged:** no IV/skew VALUES for 2018-2020 have been fetched
+  (auth check was ticker metadata only). Order remains freeze → pull → gate → test.
+
+### Next-session bootstrap (start here)
+
+1. Read this file + `phase7a2-preregistration.md` (monetization map) +
+   `phase7-findings.md` §7.1/§A2. Evaluate/adjust this plan BEFORE the freeze.
+2. Pull ORATS field docs / one out-of-window sample row (e.g. 2016 or 2021 excluded
+   ticker) to pin exact field names for: ATM IV₃₀ (smvsummaries), 25-delta IVs or
+   slope/deriv (monies/implied or summaries), per-strike bid/ask (hist/strikes).
+3. Freeze `branchB-preregistration.md` (T-B1 + T-B2 from §4, blanks filled, BY-FDR
+   q=0.10, spread-anchored bars). Commit before the bulk pull.
+4. `scripts/branchB_pull.py` (resumable, request-counting) → `data/orats/`.
+5. `scripts/branchB_gate.py` → gate verdict → on PASS run the registered tests.
 
 ## 1. Why this door, and why it just got wider
 
