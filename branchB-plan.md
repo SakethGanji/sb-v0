@@ -43,6 +43,32 @@ before any IV data is opened, with only data-contract blanks filled in.
 - **Discipline unchanged:** no IV/skew VALUES for 2018-2020 have been fetched
   (auth check was ticker metadata only). Order remains freeze → pull → gate → test.
 
+### Storage & no-refetch policy (added 2026-07-07 — the API is called ONCE per datum, ever)
+
+- **Raw-response cache is the source of truth:** every API response is written
+  verbatim, gzipped, BEFORE parsing: `data/orats/raw/<endpoint>/<ticker>__<range>.json.gz`.
+  The downloader is idempotent — an existing raw file is never re-fetched (same
+  resumable pattern as `phase7a2_build_profiles.py`); parser bugs are fixed by
+  re-parsing the cache, never by re-calling the API.
+- **Canonical layer:** `data/orats/parquet/<endpoint>/…` built purely FROM the raw
+  cache by a separate script. **Analysis scripts read ONLY the parquet layer; the
+  ONLY thing allowed to call the API is `branchB_pull.py`.** Once the pull is done,
+  session usage of the orats CLI/MCP is restricted to `glossary`/`--schema`/
+  `--list-fields` (no-quota); any data question is answered from local parquet.
+- **Request ledger:** every call appends (endpoint, params, rows, timestamp) to
+  `data/orats/request_log.jsonl` — quota usage stays auditable against the 100k cap.
+- **Pull breadth (one month of access → take everything we could ever need):**
+  summaries + monies-implied for the FULL available history (2007→present) for the
+  ~700-name universe — per-ticker range calls make this barely more expensive than
+  2018-2020 alone, and it puts the 2021-22 §7.7 confirmation data on disk in the
+  same pass (a PASS must not require a second subscription month). Strikes: 2018-2020
+  test sample + the matching 2021-22 sample. **Having windows on disk does not
+  unseal them** — tests read only the windows their pre-registration allows; the
+  seal is enforced by the scripts' date filters and the standing protocol, exactly
+  as with the equity holdout (on disk since 2023, never opened).
+- Backup note: `data/` lives on the T7; `data/orats/` raw+parquet is small (likely
+  < 2-3 GB) — copy `raw/` somewhere second if paranoid; it is the $199 artifact.
+
 ### Next-session bootstrap (start here)
 
 1. Read this file + `phase7a2-preregistration.md` (monetization map) +
