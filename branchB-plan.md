@@ -13,16 +13,33 @@ before any IV data is opened, with only data-contract blanks filled in.
   rotating, the ORATS dashboard reissues it and only that file changes). Base URL
   `https://api.orats.io/datav2`, auth via `token` query param. Client helper:
   **`scripts/orats_client.py`** (tested; retry/backoff; reads the token file).
-- **`@orats/cli` v1.1.0 is broken upstream** (its `incur` dep imports
-  `StdioServerTransport` from `@modelcontextprotocol/server`, which no published
-  version exports — tried beta.2 and alpha.4). Uninstalled; the REST path via the
-  client helper is the supported route. Revisit the CLI/MCP only if they fix it.
-- **Request budget (20k/mo, binding constraint of the tier):** per-ticker
-  hist range calls for `hist/smvsummaries` + `hist/monies/implied` over ~700
-  tickers ≈ 1.4–3k requests (chunk by year if response caps bite → ≤ 6k). Strikes
-  history is the expensive one — pull it ONLY for the straddle/spread audit on a
-  pre-registered SAMPLE (e.g. 100 names × month-ends ≈ 3.6k requests), not the full
-  panel. Log request counts in the downloader; abort at 15k used.
+- **UPGRADED 2026-07-07: Live Data API, 100,000 requests/month** (Basic License).
+- **`@orats/cli` v1.1.0 installed and WORKING after a local one-line patch:** its
+  `incur` dep imports `StdioServerTransport` from `@modelcontextprotocol/server`
+  root, but every published version exports it only at the `/stdio` subpath. Patch
+  (re-apply after any `npm update -g @orats/cli`):
+  `.../@orats/cli/node_modules/incur/dist/Mcp.js` line 1 → split into
+  `import { McpServer } from '@modelcontextprotocol/server';` +
+  `import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';`
+- **Hooked up:** `ORATS_TOKEN` exported from `~/.bashrc` (reads `~/.orats_token`);
+  `orats` MCP server registered for Claude Code; `orats-data` / `orats-glossary`
+  skills synced. **All 26 endpoint schemas + field docs dumped to
+  `~/.orats/endpoints/`** (`*.schema.json`, `*.fields.json`, no-quota lookups) plus
+  `~/.orats/llms-manifest.json` — the freeze pins field names from THESE files.
+  REST fallback remains `scripts/orats_client.py`.
+- **Contract facts already pinned** (from the field docs, no values fetched):
+  `hist-eod-summaries` has `iv30d` (DECIMAL, 0.30=30%), `exErnIv30d`
+  (earnings-cleaned), `rSlp30`/`rDrv30` (30d skew slope/curvature ≡ cores
+  slope/deriv); **unit gotcha:** `*-cores` endpoints quote IV in PERCENTAGE POINTS
+  (25.36 = 25.36%) while summaries are decimal — never mix without /100.
+- **Request budget (100k/mo — comfortable, still logged):** summaries + monies
+  per-ticker range calls ≈ 3–6k total; strikes for the spread audit can now afford
+  ~700 names × month-ends with `--dte`/`--delta` filters (near-ATM ~30d only)
+  ≈ 25k. Downloader logs request counts; abort at 80k used.
+- Efficient-CLI conventions for the pull: `--fields` to trim payloads, `--format
+  jsonl` piped to files, `--trade-date` ranges per ticker, `--dte 20,45 --delta
+  0.35,0.65` for the straddle legs; `orats glossary <field>` for any field question
+  (no quota).
 - **Discipline unchanged:** no IV/skew VALUES for 2018-2020 have been fetched
   (auth check was ticker metadata only). Order remains freeze → pull → gate → test.
 
